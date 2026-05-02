@@ -18,6 +18,7 @@ local socketutil = require("socketutil")
 local util = require("util")
 local _ = require("gettext")
 local T = FFIUtil.template
+local Dispatcher = require("dispatcher")
 
 local base64_encode = require("mime").b64
 local sha2 = require("ffi/sha2")
