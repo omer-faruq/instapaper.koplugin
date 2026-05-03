@@ -191,11 +191,20 @@ function Instapaper:onInstapaperDownloadUnread()
     return true
 end
 
+function Instapaper:onInstapaperUnread()
+    self:ensureOnlineAndLoggedIn(function()
+        self:fetchAndShowArticles("unread")
+    end)
+    return true
+end
+
 function Instapaper:onDispatcherRegisterActions()
     Dispatcher:registerAction("instapaper_bulk_download",
         { category = "none", event = "InstapaperBulkDownload", title = _("Instapaper bulk download"), general = true, })
     Dispatcher:registerAction("instapaper_download_unread",
-        { category = "none", event = "InstapaperDownloadUnread", title = _("Instapaper download unread"), general = true, separator = true, })
+        { category = "none", event = "InstapaperDownloadUnread", title = _("Instapaper download unread"), general = true, })
+    Dispatcher:registerAction("instapaper_unread",
+        { category = "none", event = "InstapaperUnread", title = _("Instapaper: unread"), general = true, separator = true, })
 end
 
 --------------------------------------------------------------------
