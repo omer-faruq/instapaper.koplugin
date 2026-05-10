@@ -215,6 +215,28 @@ function Instapaper:init()
     self.ui.menu:registerToMainMenu(self)
     self:onDispatcherRegisterActions()
     self:loadSettings()
+    self:loadPendingPool()
+    if self.ui and self.ui.link then
+        self:registerLinkPopupButton()
+    end
+end
+
+function Instapaper:onReaderReady()
+    if self:countPending() > 0 then
+        local NetworkMgr = require("ui/network/manager")
+        if NetworkMgr:isOnline() then
+            UIManager:scheduleIn(2, function()
+                self:drainPendingQueue({ silent = true })
+            end)
+        end
+    end
+end
+
+function Instapaper:onNetworkConnected()
+    if self:countPending() == 0 then return end
+    UIManager:scheduleIn(1, function()
+        self:drainPendingQueue({ silent = false })
+    end)
 end
 
 function Instapaper:loadSettings()
@@ -230,6 +252,10 @@ function Instapaper:loadSettings()
     self.include_images     = self.settings:readSetting("include_images") or false
     self.after_download_action = self.settings:readSetting("after_download_action") or "none"
     self.cache_folder       = self.settings:readSetting("cache_folder")
+    self.auto_connect_network = self.settings:readSetting("auto_connect_network")
+    if self.auto_connect_network == nil then
+        self.auto_connect_network = true
+    end
 end
 
 function Instapaper:saveSettings()
@@ -243,6 +269,7 @@ function Instapaper:saveSettings()
     self.settings:saveSetting("include_images",     self.include_images)
     self.settings:saveSetting("after_download_action", self.after_download_action)
     self.settings:saveSetting("cache_folder",       self.cache_folder)
+    self.settings:saveSetting("auto_connect_network", self.auto_connect_network)
     self.settings:flush()
 end
 
@@ -318,6 +345,19 @@ function Instapaper:addToMainMenu(menu_items)
                 keep_menu_open = true,
                 callback = function()
                     self:clearDownloadsCache()
+                end,
+            },
+            {
+                text_func = function()
+                    local count = #self:getPendingUrls()
+                    if count > 0 then
+                        return T(_("Process pending URLs (%1)"), tostring(count))
+                    else
+                        return _("Process pending URLs")
+                    end
+                end,
+                callback = function()
+                    self:processPendingPool()
                 end,
                 separator = true,
             },
@@ -448,6 +488,10 @@ function Instapaper:showSettingsDialog()
     local include_images = self.include_images or false
     local after_download_action = self.after_download_action or "none"
     local cache_folder = self.cache_folder
+    local auto_connect = self.auto_connect_network
+    if auto_connect == nil then
+        auto_connect = true
+    end
 
     local settings_dialog
     local function rebuildSettingsDialog()
@@ -479,12 +523,15 @@ function Instapaper:showSettingsDialog()
             cache_label = _("Default")
         end
 
+        local auto_label = auto_connect and _("ON") or _("OFF")
+        
         settings_dialog = ButtonDialog:new{
             title = _("Instapaper settings")
                 .. "\n" .. _("Article list limit: ") .. limit_label
                 .. "\n" .. _("Output format: ") .. fmt_label
                 .. "\n" .. _("Include images (EPUB): ") .. img_label
                 .. "\n" .. _("After download: ") .. action_label
+                .. "\n" .. _("Auto connect network: ") .. auto_label
                 .. "\n" .. _("Cache folder: ") .. cache_label,
             buttons = {
                 {
@@ -527,6 +574,13 @@ function Instapaper:showSettingsDialog()
                 },
                 {
                     {
+                        text = _("Auto connect: ") .. (auto_connect and _("ON") or _("OFF")),
+                        callback = function()
+                            auto_connect = not auto_connect
+                            rebuildSettingsDialog()
+                        end,
+                    },
+                    {
                         text = _("< Cache folder >"),
                         callback = function()
                             UIManager:close(settings_dialog)
@@ -546,6 +600,7 @@ function Instapaper:showSettingsDialog()
                             self.output_format  = output_format
                             self.include_images = include_images
                             self.after_download_action = after_download_action
+                            self.auto_connect_network = auto_connect
                             self.cache_folder = cache_folder
                             self:saveSettings()
                             UIManager:show(InfoMessage:new{
@@ -1586,6 +1641,250 @@ function Instapaper:starBookmark(bookmark_id)
         text = ok and _("Starred.") or T(_("Failed: %1"), body or ""),
         timeout = 2,
     })
+end
+
+--------------------------------------------------------------------
+-- Pending pool for offline link saving
+--------------------------------------------------------------------
+
+function Instapaper:loadPendingPool()
+    self.pending_pool = LuaSettings:open(
+        DataStorage:getSettingsDir() .. "/instapaper_pending.lua")
+end
+
+function Instapaper:getPendingUrls()
+    if not self.pending_pool then
+        self:loadPendingPool()
+    end
+    return self.pending_pool:readSetting("pending_urls") or {}
+end
+
+function Instapaper:savePendingUrls(urls)
+    if not self.pending_pool then
+        self:loadPendingPool()
+    end
+    self.pending_pool:saveSetting("pending_urls", urls)
+    self.pending_pool:flush()
+end
+
+function Instapaper:addToPendingPool(url, title)
+    local pending = self:getPendingUrls()
+    table.insert(pending, {
+        url = url,
+        title = title or url,
+        added_at = os.time(),
+    })
+    self:savePendingUrls(pending)
+end
+
+function Instapaper:countPending()
+    return #self:getPendingUrls()
+end
+
+function Instapaper:drainPendingQueue(opts)
+    opts = opts or {}
+    if self._draining then return end
+    if not self:isLoggedIn() then return end
+    
+    local NetworkMgr = require("ui/network/manager")
+    if not NetworkMgr:isOnline() then return end
+    
+    local pending = self:getPendingUrls()
+    if #pending == 0 then return end
+    
+    self._draining = true
+    local Trapper = require("ui/trapper")
+    Trapper:wrap(function()
+        local success_count = 0
+        local fail_count = 0
+        local remaining = {}
+        local stopped_for_network = false
+        local last_err
+        
+        for _, item in ipairs(pending) do
+            if stopped_for_network then
+                table.insert(remaining, item)
+            else
+                local ok = self:addBookmark(item.url, item.title)
+                if ok then
+                    success_count = success_count + 1
+                else
+                    fail_count = fail_count + 1
+                    if not NetworkMgr:isOnline() then
+                        stopped_for_network = true
+                        table.insert(remaining, item)
+                    else
+                        table.insert(remaining, item)
+                        last_err = "Failed to add bookmark"
+                    end
+                end
+            end
+        end
+        
+        self:savePendingUrls(remaining)
+        self._draining = false
+        
+        if opts.silent then return end
+        if success_count == 0 and fail_count == 0 then return end
+        
+        local parts = {}
+        if success_count > 0 then
+            table.insert(parts, T(_("Sent %1 pending URL(s) to Instapaper."), success_count))
+        end
+        if fail_count > 0 then
+            table.insert(parts, T(_("Failed: %1"), fail_count))
+            if last_err then
+                table.insert(parts, "(" .. last_err .. ")")
+            end
+        end
+        if #remaining > 0 then
+            table.insert(parts, T(_("%1 still pending."), #remaining))
+        end
+        
+        local Notification = require("ui/widget/notification")
+        UIManager:show(Notification:new{ text = table.concat(parts, " ") })
+    end)
+end
+
+function Instapaper:processPendingPool()
+    if not self:isLoggedIn() then
+        UIManager:show(InfoMessage:new{
+            text = _("Please log in first."),
+        })
+        return
+    end
+    
+    local pending = self:getPendingUrls()
+    if #pending == 0 then
+        UIManager:show(InfoMessage:new{
+            text = _("No pending URLs."),
+            timeout = 2,
+        })
+        return
+    end
+    
+    NetworkMgr:runWhenOnline(function()
+        self:drainPendingQueue({ silent = false })
+    end)
+end
+
+--------------------------------------------------------------------
+-- Add bookmark API
+--------------------------------------------------------------------
+
+function Instapaper:addBookmark(url, title, description)
+    if not url or url == "" then
+        return false
+    end
+    
+    local params = { url = url }
+    if title and title ~= "" then
+        params.title = title
+    end
+    if description and description ~= "" then
+        params.description = description
+    end
+    
+    local ok, body, code = self:apiRequest("/api/1/bookmarks/add", params)
+    
+    if ok then
+        logger.info("Instapaper: bookmark added", url)
+        return true
+    else
+        logger.warn("Instapaper: failed to add bookmark", url, code)
+        return false
+    end
+end
+
+function Instapaper:addBookmarkFromLink(url, title)
+    if not self:isLoggedIn() then
+        UIManager:show(InfoMessage:new{
+            text = _("Please configure and log in to Instapaper first."),
+            timeout = 2,
+        })
+        return
+    end
+    
+    local NetworkMgr = require("ui/network/manager")
+    
+    -- If network is already online, try to send immediately
+    if NetworkMgr:isOnline() then
+        local ok = self:addBookmark(url, title)
+        if ok then
+            UIManager:show(InfoMessage:new{
+                text = _("Added to Instapaper."),
+                timeout = 2,
+            })
+        else
+            self:addToPendingPool(url, title)
+            UIManager:show(InfoMessage:new{
+                text = _("Failed. Added to pending pool."),
+                timeout = 2,
+            })
+        end
+        return
+    end
+    
+    -- Network is offline
+    if self.auto_connect_network then
+        -- Try to connect and send
+        NetworkMgr:runWhenOnline(function()
+            local ok = self:addBookmark(url, title)
+            if ok then
+                UIManager:show(InfoMessage:new{
+                    text = _("Added to Instapaper."),
+                    timeout = 2,
+                })
+            else
+                self:addToPendingPool(url, title)
+                UIManager:show(InfoMessage:new{
+                    text = _("Failed. Added to pending pool."),
+                    timeout = 2,
+                })
+            end
+        end)
+    else
+        -- Auto connect is off, add to pool
+        self:addToPendingPool(url, title)
+        UIManager:show(InfoMessage:new{
+            text = _("Added to pending pool."),
+            timeout = 2,
+        })
+    end
+end
+
+--------------------------------------------------------------------
+-- Link popup button
+--------------------------------------------------------------------
+
+function Instapaper:registerLinkPopupButton()
+    if not self.ui or not self.ui.link then
+        return
+    end
+    
+    local Blitbuffer = require("ffi/blitbuffer")
+    
+    self.ui.link:addToExternalLinkDialog("45_add_to_instapaper", function(external_dialog, link_url)
+        return {
+            text = _("Add to Instapaper"),
+            background = Blitbuffer.COLOR_WHITE,
+            callback = function()
+                UIManager:close(external_dialog.external_link_dialog)
+                local target_url = link_url
+                if type(target_url) ~= "string" or not target_url:match("^https?://") then
+                    UIManager:show(InfoMessage:new{
+                        text = _("Invalid URL."),
+                        timeout = 2,
+                    })
+                    return
+                end
+                self:addBookmarkFromLink(target_url, target_url)
+            end,
+            show_in_dialog_func = function()
+                return type(link_url) == "string" and link_url:match("^https?://") ~= nil
+            end,
+        }
+    end)
 end
 
 return Instapaper
