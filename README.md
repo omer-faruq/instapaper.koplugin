@@ -16,6 +16,9 @@ Download and read articles from your Instapaper account directly in KOReader.
 - **Title injection** — missing article titles are added as a heading in the downloaded HTML
 - **Reading progress** display (percentage read)
 - **Configurable article list limit** — fetch up to 10, 25, 50, 100, 200, or 500 articles at once
+- **Send to Instapaper** — Add web links to Instapaper directly from document link popups
+- **Offline queue** — Links are queued when offline and automatically sent when network becomes available
+- **Auto WiFi connect for links** — Configurable automatic network connection when adding links
 - **Open downloads folder** shortcut in the menu
 - **Clear downloads cache** — delete all downloaded files and folders with a single tap
 - **Persistent credentials** — stay logged in across sessions
@@ -123,6 +126,26 @@ Select **Open downloads folder** to open the local `koreader/instapaper/` direct
 
 Select **Clear downloads cache** to delete all downloaded files and folders (including `.sdr` metadata folders) from the downloads directory. A confirmation dialog is shown before deletion.
 
+### Send Web Links to Instapaper
+
+When reading a document that contains web links:
+
+1. **Tap a link** in the document
+2. In the link popup dialog, select **Add to Instapaper**
+3. The link is sent to your Instapaper account:
+   - If **network is online** → Sent immediately
+   - If **Auto connect network** is ON → Network opens automatically and link is sent
+   - If **Auto connect network** is OFF → Link is added to pending queue
+4. Queued links are **automatically sent** when network becomes available
+
+#### Process Pending Links Manually
+
+If you have links waiting in the queue:
+
+1. Open the Instapaper menu
+2. Select **Process pending URLs (X)** where X is the number of queued links
+3. Network will connect and all pending links will be sent
+
 ### Settings
 
 Select **Settings** from the Instapaper menu to configure:
@@ -134,6 +157,9 @@ Select **Settings** from the Instapaper menu to configure:
   - **None** (default) — No action, article stays in its current folder
   - **Archive only** — Move article to Archive folder
   - **Archive + Mark read** — Move to Archive and mark as 100% read
+- **Auto connect network** — When adding links to Instapaper:
+  - **ON** (default) — Automatically open network connection and send immediately
+  - **OFF** — Add to pending queue without connecting; links are sent when network is opened elsewhere
 
 ## Implementation Details
 
@@ -147,11 +173,20 @@ This plugin uses the **Instapaper Full API** (OAuth 1.0a):
 ### API Endpoints
 - **`/api/1/bookmarks/list`** — Fetch articles (with folder filtering)
 - **`/api/1/bookmarks/get_text`** — Download article HTML
+- **`/api/1/bookmarks/add`** — Add a new bookmark (URL) to Instapaper
 - **`/api/1/bookmarks/archive`** — Archive an article
 - **`/api/1/bookmarks/update_read_progress`** — Update reading progress on an article
 - **`/api/1/bookmarks/delete`** — Delete an article
 - **`/api/1/bookmarks/star`** — Star an article
 - **`/api/1/folders/list`** — Fetch user-created folders
+
+### Offline Queue
+- Pending links are stored in `settings/instapaper_pending.lua`
+- Each queued item contains: URL, title, and timestamp
+- Queue is automatically processed when:
+  - Network connection is established (`onNetworkConnected` event)
+  - Plugin loads and network is already online (`onReaderReady` event)
+  - User manually triggers **Process pending URLs** from the menu
 
 ### OAuth 1.0a Signature
 The plugin implements RFC 5849 OAuth 1.0a signature generation:
