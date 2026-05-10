@@ -602,6 +602,17 @@ function Instapaper:showCacheFolderDialog(return_callback, current_folder)
                         UIManager:close(cache_dialog)
                         
                         if new_path and new_path ~= "" then
+                            -- Security check: prevent dangerous paths
+                            if self:isDangerousPath(new_path) then
+                                UIManager:show(InfoMessage:new{
+                                    text = _("This path cannot be used as a cache folder for safety reasons.\n\nPlease choose a subfolder instead of a system directory."),
+                                })
+                                if return_callback then
+                                    return_callback(current_folder)
+                                end
+                                return
+                            end
+                            
                             local attr = lfs.attributes(new_path)
                             if attr and attr.mode == "directory" then
                                 if return_callback then
@@ -1126,8 +1137,25 @@ function Instapaper:clearDownloadsCache()
     local dir = self:getDownloadDir()
     local ConfirmBox = require("ui/widget/confirmbox")
 
+    -- Security check: if using custom folder, disable cache wipe
+    local using_custom = self.cache_folder and self.cache_folder ~= ""
+    if using_custom then
+        UIManager:show(InfoMessage:new{
+            text = _("Cache clearing is disabled when using a custom cache folder for safety reasons.\n\nTo clear the cache, please manually delete Instapaper files from your custom folder."),
+        })
+        return
+    end
+
+    -- Additional safety check for dangerous paths
+    if self:isDangerousPath(dir) then
+        UIManager:show(InfoMessage:new{
+            text = _("Cannot clear cache: the cache folder path appears to be a system directory.\n\nPlease check your cache folder settings."),
+        })
+        return
+    end
+
     UIManager:show(ConfirmBox:new{
-        text = _("Delete all files and folders in the Instapaper downloads folder?"),
+        text = _("Delete Instapaper files (.html, .epub, .sdr, .tmp) from the downloads folder?"),
         ok_text = _("Delete"),
         ok_callback = function()
             self:_doClearDownloadsCache(dir)
@@ -1136,32 +1164,88 @@ function Instapaper:clearDownloadsCache()
 end
 
 function Instapaper:_doClearDownloadsCache(dir)
-    local function removeAll(path)
+    -- Only delete files created by Instapaper plugin
+    local function isInstapaperFile(filename)
+        local lower = filename:lower()
+        -- Match .html, .epub files, .sdr folders, and .tmp files from failed EPUB creation
+        return lower:match("%.html$") or lower:match("%.epub$") or lower:match("%.sdr$") or lower:match("%.tmp$")
+    end
+
+    local function removeInstapaperFiles(path)
         local attr = lfs.attributes(path)
-        if not attr then return end
+        if not attr then return 0 end
+        
+        local removed = 0
         if attr.mode == "directory" then
+            -- Recursively remove files in .sdr folders
             for entry in lfs.dir(path) do
                 if entry ~= "." and entry ~= ".." then
-                    removeAll(path .. "/" .. entry)
+                    removed = removed + removeInstapaperFiles(path .. "/" .. entry)
                 end
             end
-            lfs.rmdir(path)
+            -- Try to remove the directory if it's a .sdr folder and now empty
+            if path:match("%.sdr$") then
+                lfs.rmdir(path)
+            end
         else
-            os.remove(path)
+            -- Only remove if it's an Instapaper file
+            if isInstapaperFile(path) then
+                os.remove(path)
+                removed = 1
+            end
         end
+        return removed
     end
 
     local count = 0
     for entry in lfs.dir(dir) do
         if entry ~= "." and entry ~= ".." then
-            removeAll(dir .. "/" .. entry)
-            count = count + 1
+            local full_path = dir .. "/" .. entry
+            count = count + removeInstapaperFiles(full_path)
         end
     end
+    
     UIManager:show(InfoMessage:new{
-        text = T(_("Deleted %1 item(s) from downloads folder."), count),
+        text = T(_("Deleted %1 Instapaper file(s) from downloads folder."), count),
         timeout = 3,
     })
+end
+
+function Instapaper:isDangerousPath(path)
+    if not path or path == "" then
+        return false
+    end
+    
+    -- Normalize path
+    local normalized = path:gsub("//+", "/"):gsub("/$", "")
+    
+    -- Dangerous paths that should never be used as cache folder
+    local dangerous_paths = {
+        "/",
+        "/mnt",
+        "/mnt/onboard",
+        "/mnt/sd",
+        "/mnt/us",
+        "/mnt/us/documents",
+        "/sdcard",
+        "/storage",
+        "/system",
+        "/data",
+        "/etc",
+        "/bin",
+        "/usr",
+        "/lib",
+        "/home",
+        "/root"
+    }
+    
+    for _, dangerous in ipairs(dangerous_paths) do
+        if normalized == dangerous then
+            return true
+        end
+    end
+    
+    return false
 end
 
 function Instapaper:openDownloadsFolder()
