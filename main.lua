@@ -734,10 +734,11 @@ end
 --------------------------------------------------------------------
 
 function Instapaper:fetchAndShowArticles(folder_id, folder_name)
-    UIManager:show(InfoMessage:new{
+    local info = InfoMessage:new{
         text = _("Fetching articles..."),
-        timeout = 1,
-    })
+    }
+    UIManager:show(info)
+    UIManager:forceRePaint()
 
     local params = { limit = tostring(self.article_limit or 50) }
     if folder_id then
@@ -778,6 +779,8 @@ function Instapaper:fetchAndShowArticles(folder_id, folder_name)
         return
     end
 
+    UIManager:close(info)
+    UIManager:forceRePaint()
     self:showArticleMenu(bookmarks, folder_id, folder_name)
 end
 
