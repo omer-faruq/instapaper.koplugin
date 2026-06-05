@@ -1060,6 +1060,34 @@ function Instapaper:injectTitleIfMissing(html, bookmark)
     return result
 end
 
+function Instapaper:injectHtmlMetadata(html, bookmark)
+    local parts = {}
+    local url = bookmark.url
+    if url and url ~= "" then
+        local domain = url:match("^https?://([^/]+)")
+        if domain then
+            domain = domain:gsub("^www%.", "")
+            local escaped = domain:gsub("&", "&amp;"):gsub('"', "&quot;")
+            parts[#parts + 1] = '<meta name="author" content="' .. escaped .. '"/>'
+        end
+    end
+    local desc = bookmark.description
+    if desc and desc ~= "" then
+        local escaped = desc:gsub("&", "&amp;"):gsub('"', "&quot;")
+        parts[#parts + 1] = '<meta name="description" content="' .. escaped .. '"/>'
+    end
+    if #parts == 0 then return html end
+    local inject = table.concat(parts, "\n")
+    local result, n = html:gsub("(</head>)", inject .. "\n%1", 1)
+    if n == 0 then
+        result, n = html:gsub("(<head[^>]*>)", "%1\n" .. inject, 1)
+    end
+    if n == 0 then
+        result = inject .. "\n" .. html
+    end
+    return result
+end
+
 function Instapaper:fetchArticleHtml(bookmark)
     local ok, html, code = self:apiRequest("/api/1/bookmarks/get_text", {
         bookmark_id = tostring(bookmark.bookmark_id),
@@ -1096,6 +1124,7 @@ function Instapaper:saveArticle(bookmark, html)
         end
         return filepath
     else
+        html = self:injectHtmlMetadata(html, bookmark)
         return self:saveArticleHtml(bookmark, html)
     end
 end

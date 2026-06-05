@@ -67,6 +67,10 @@ local function downloadImageToMemory(url)
     return content, ct:lower()
 end
 
+local function xmlEsc(s)
+    return (s or ""):gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;")
+end
+
 local function isTinyImage(tag)
     local function getAttr(t, attr)
         return t:match(attr .. '%s*=%s*"([^"]*)"')
@@ -274,6 +278,18 @@ function InstapaperEpub.createEpub(bookmark, html, download_dir, include_images)
 </container>]], mtime)
 
     -- OEBPS/content.opf
+    local author_str = article_url:match("^https?://([^/]+)")
+    if author_str then author_str = author_str:gsub("^www%.", "") end
+    local desc_str = (bookmark.description ~= nil and bookmark.description ~= "") and bookmark.description or nil
+
+    local meta_extra = ""
+    if author_str then
+        meta_extra = meta_extra .. "    <dc:creator>" .. xmlEsc(author_str) .. "</dc:creator>\n"
+    end
+    if desc_str then
+        meta_extra = meta_extra .. "    <dc:description>" .. xmlEsc(desc_str) .. "</dc:description>\n"
+    end
+
     local opf_parts = {}
     table.insert(opf_parts, string.format([[
 <?xml version='1.0' encoding='utf-8'?>
@@ -282,13 +298,13 @@ function InstapaperEpub.createEpub(bookmark, html, download_dir, include_images)
         unique-identifier="bookid" version="2.0">
   <metadata>
     <dc:title>%s</dc:title>
-    <dc:publisher>KOReader %s</dc:publisher>
+%s    <dc:publisher>KOReader %s</dc:publisher>
   </metadata>
   <manifest>
     <item id="ncx"     href="toc.ncx"      media-type="application/x-dtbncx+xml"/>
     <item id="content" href="content.xhtml" media-type="application/xhtml+xml"/>
     <item id="css"     href="stylesheet.css" media-type="text/css"/>
-]], escaped_title, Version:getCurrentRevision()))
+]], escaped_title, meta_extra, Version:getCurrentRevision()))
 
     if include_images then
         for i, img in ipairs(images) do
