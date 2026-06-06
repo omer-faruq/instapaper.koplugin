@@ -1060,32 +1060,58 @@ function Instapaper:injectTitleIfMissing(html, bookmark)
     return result
 end
 
-function Instapaper:injectHtmlMetadata(html, bookmark)
-    local parts = {}
-    local url = bookmark.url
-    if url and url ~= "" then
-        local domain = url:match("^https?://([^/]+)")
-        if domain then
-            domain = domain:gsub("^www%.", "")
-            local escaped = domain:gsub("&", "&amp;"):gsub('"', "&quot;")
-            parts[#parts + 1] = '<meta name="author" content="' .. escaped .. '"/>'
-        end
+-- Derive author/origin from the article URL's host, e.g.
+-- "https://www.example.com/a/b.html" -> "example.com".
+function Instapaper:deriveAuthorFromUrl(url)
+    if not url or url == "" then return nil end
+    local domain = url:match("^https?://([^/]+)")
+    if not domain then return nil end
+    domain = domain:gsub("^www%.", "")
+    if domain == "" then return nil end
+    return domain
+end
+
+-- Write KOReader's own metadata sidecar (custom_metadata.lua) for a downloaded
+-- article so that the title, author/origin and description show up in the file
+-- manager and "Book information" dialog.
+--
+-- This is needed because crengine only reads <title> from plain HTML; it does
+-- not extract author/description from HTML <meta> tags (EPUB gets these from the
+-- OPF instead). custom_props override whatever the engine extracts.
+function Instapaper:writeBookMetadata(filepath, bookmark)
+    if not filepath then return end
+
+    local title = bookmark.title
+    if title == "" then title = nil end
+    local authors = self:deriveAuthorFromUrl(bookmark.url)
+    local description = bookmark.description
+    if description == "" then description = nil end
+
+    if not (title or authors or description) then return end
+
+    local props = {}
+    if title       then props.title       = title       end
+    if authors     then props.authors     = authors     end
+    if description then props.description  = description end
+
+    -- Wrapped in pcall: writing metadata is best-effort. If a future KOReader
+    -- release changes the DocSettings custom-metadata API, we must not let that
+    -- break the article download itself -- worst case, metadata is just skipped.
+    local ok, err = pcall(function()
+        local DocSettings = require("docsettings")
+        local doc_settings = DocSettings.openSettingsFile()
+        -- doc_props: a backup of the "original" metadata, used as a fast fallback
+        -- for display before the document has ever been opened.
+        doc_settings:saveSetting("doc_props", {
+            title = title, authors = authors, description = description,
+        })
+        -- custom_props: overrides that always win over engine-extracted metadata.
+        doc_settings:saveSetting("custom_props", props)
+        return doc_settings:flushCustomMetadata(filepath)
+    end)
+    if not ok then
+        logger.warn("Instapaper: could not write metadata sidecar for", filepath, err)
     end
-    local desc = bookmark.description
-    if desc and desc ~= "" then
-        local escaped = desc:gsub("&", "&amp;"):gsub('"', "&quot;")
-        parts[#parts + 1] = '<meta name="description" content="' .. escaped .. '"/>'
-    end
-    if #parts == 0 then return html end
-    local inject = table.concat(parts, "\n")
-    local result, n = html:gsub("(</head>)", inject .. "\n%1", 1)
-    if n == 0 then
-        result, n = html:gsub("(<head[^>]*>)", "%1\n" .. inject, 1)
-    end
-    if n == 0 then
-        result = inject .. "\n" .. html
-    end
-    return result
 end
 
 function Instapaper:fetchArticleHtml(bookmark)
@@ -1114,19 +1140,28 @@ end
 -- Returns filepath on success, nil on failure.
 function Instapaper:saveArticle(bookmark, html)
     local fmt = self.output_format or "html"
+    local filepath
+    local is_html = true
     if fmt == "epub" then
         local InstapaperEpub = require("instapaper_epub")
-        local filepath, err = InstapaperEpub.createEpub(
+        local err
+        filepath, err = InstapaperEpub.createEpub(
             bookmark, html, self:getDownloadDir(), self.include_images)
-        if not filepath then
+        if filepath then
+            is_html = false
+        else
             logger.warn("Instapaper: EPUB creation failed, falling back to HTML", err)
-            return self:saveArticleHtml(bookmark, html)
+            filepath = self:saveArticleHtml(bookmark, html)
         end
-        return filepath
     else
-        html = self:injectHtmlMetadata(html, bookmark)
-        return self:saveArticleHtml(bookmark, html)
+        filepath = self:saveArticleHtml(bookmark, html)
     end
+    -- EPUB carries its metadata in the OPF (read natively by crengine), so we
+    -- only need the KOReader metadata sidecar for HTML output.
+    if is_html then
+        self:writeBookMetadata(filepath, bookmark)
+    end
+    return filepath
 end
 
 -- Download only (no open), keeps caller menu open
