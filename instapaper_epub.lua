@@ -38,8 +38,14 @@ local mimetype_to_ext = {
 
 local function resolveUrl(src, base_url)
     if not src or src == "" then return nil end
-    if src:find("^data:") then return nil end
-    if src:find("^[%w][%w%+%-.]*:") then return src end
+    local scheme = src:match("^([%w][%w%+%-.]*):")
+    if scheme then
+        -- Only http(s) is downloadable; reject data:, file:, mailto:, ftp:, etc.
+        -- (socket.http has no handler for other schemes and errors uncaught).
+        scheme = scheme:lower()
+        if scheme == "http" or scheme == "https" then return src end
+        return nil
+    end
     if not base_url or base_url == "" then return nil end
     return urlmod.absolute(base_url, src)
 end
@@ -47,7 +53,7 @@ end
 local function downloadImageToMemory(url)
     local sink = {}
     socketutil:set_timeout(socketutil.LARGE_BLOCK_TIMEOUT, socketutil.LARGE_TOTAL_TIMEOUT)
-    local ok, code, headers = http.request{
+    local pok, ok, code, headers = pcall(http.request, {
         url     = url,
         method  = "GET",
         sink    = ltn12.sink.table(sink),
@@ -55,8 +61,12 @@ local function downloadImageToMemory(url)
             ["Accept-Encoding"] = "identity",
             ["User-Agent"]      = "KOReader Instapaper",
         },
-    }
+    })
     socketutil:reset_timeout()
+    if not pok then
+        logger.info("InstapaperEpub: image download errored", url, ok)
+        return nil, nil
+    end
     if not ok or tostring(code):sub(1, 1) ~= "2" then
         logger.info("InstapaperEpub: image download failed", url, code)
         return nil, nil
