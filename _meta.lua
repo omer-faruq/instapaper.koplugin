@@ -3,5 +3,5 @@ return {
     name = "instapaper",
     fullname = _("Instapaper"),
     description = _([[Download and read articles saved in Instapaper.]]),
-    version = "1.3.2",
+    version = "1.3.3",
 }
