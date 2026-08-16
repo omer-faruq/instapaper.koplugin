@@ -166,16 +166,30 @@ local function rewriteImages(html, base_url)
 end
 
 --------------------------------------------------------------------
--- EPUB path helper
+-- Download path helpers
 --------------------------------------------------------------------
 
-function InstapaperEpub.buildEpubPath(download_dir, bookmark)
-    local safe_title = (bookmark.title or "article")
+-- Build a download path named after the article title. Instapaper's numeric
+-- bookmark_id is only used as a fallback, so that untitled articles still get
+-- distinct filenames instead of all collapsing onto the same one.
+-- Articles sharing a title share a filename: re-downloading overwrites.
+function InstapaperEpub.buildFilePath(download_dir, bookmark, ext)
+    local safe_title = (bookmark.title or "")
         :gsub("[/\\%?%%%*%:%|%\"%<%>]", "_")
+        :gsub("[%z\1-\31\127]", " ")
         :sub(1, 100)
     safe_title = util.fixUtf8(safe_title, "_")
-    return download_dir .. "/"
-        .. tostring(bookmark.bookmark_id) .. "_" .. safe_title .. ".epub"
+    -- Leading/trailing spaces and trailing dots are illegal or silently
+    -- stripped on FAT/NTFS, which the usual USB/SD workflows run on.
+    safe_title = safe_title:gsub("^%s+", ""):gsub("[%s%.]+$", "")
+    if safe_title == "" then
+        safe_title = tostring(bookmark.bookmark_id or "article")
+    end
+    return download_dir .. "/" .. safe_title .. "." .. ext
+end
+
+function InstapaperEpub.buildEpubPath(download_dir, bookmark)
+    return InstapaperEpub.buildFilePath(download_dir, bookmark, "epub")
 end
 
 --------------------------------------------------------------------

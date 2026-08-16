@@ -1032,12 +1032,8 @@ function Instapaper:getDownloadDir()
 end
 
 function Instapaper:buildFilepath(bookmark)
-    local safe_title = (bookmark.title or "article")
-        :gsub("[/\\%?%%%*%:%|%\"%<%>]", "_")
-        :sub(1, 100)
-    safe_title = util.fixUtf8(safe_title, "_")
-    return self:getDownloadDir() .. "/"
-        .. tostring(bookmark.bookmark_id) .. "_" .. safe_title .. ".html"
+    local InstapaperEpub = require("instapaper_epub")
+    return InstapaperEpub.buildFilePath(self:getDownloadDir(), bookmark, "html")
 end
 
 function Instapaper:injectTitleIfMissing(html, bookmark)
