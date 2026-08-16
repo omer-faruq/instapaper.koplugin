@@ -1166,13 +1166,17 @@ end
 
 -- Download only (no open), keeps caller menu open
 function Instapaper:downloadArticleOnly(bookmark)
-    UIManager:show(InfoMessage:new{
+    -- Painted before the blocking fetch, and closed by hand afterwards: a
+    -- timeout alone would never make it to the screen.
+    local info = InfoMessage:new{
         text = _("Downloading article..."),
-        timeout = 1,
-    })
+    }
+    UIManager:show(info)
+    UIManager:forceRePaint()
 
     local html, err = self:fetchArticleHtml(bookmark)
     if not html then
+        UIManager:close(info)
         UIManager:show(InfoMessage:new{
             text = T(_("Download failed (HTTP %1)"), tostring(err)),
         })
@@ -1180,6 +1184,7 @@ function Instapaper:downloadArticleOnly(bookmark)
     end
 
     local filepath = self:saveArticle(bookmark, html)
+    UIManager:close(info)
     if not filepath then
         UIManager:show(InfoMessage:new{
             text = _("Could not save article file."),
@@ -1210,13 +1215,15 @@ function Instapaper:downloadArticleOnly(bookmark)
 end
 
 function Instapaper:downloadAndOpenArticle(bookmark)
-    UIManager:show(InfoMessage:new{
+    local info = InfoMessage:new{
         text = _("Downloading article..."),
-        timeout = 1,
-    })
+    }
+    UIManager:show(info)
+    UIManager:forceRePaint()
 
     local html, err = self:fetchArticleHtml(bookmark)
     if not html then
+        UIManager:close(info)
         UIManager:show(InfoMessage:new{
             text = T(_("Download failed (HTTP %1)"), tostring(err)),
         })
@@ -1224,6 +1231,7 @@ function Instapaper:downloadAndOpenArticle(bookmark)
     end
 
     local filepath = self:saveArticle(bookmark, html)
+    UIManager:close(info)
     if not filepath then
         UIManager:show(InfoMessage:new{
             text = _("Could not save article file."),
@@ -1582,90 +1590,142 @@ function Instapaper:showBulkDownloadDialog()
     rebuildDialog()
 end
 
+-- Shorten a title for the one-line progress message (UTF-8 safe).
+local function shortenForProgress(title)
+    if not title or title == "" or type(title) ~= "string" then
+        return _("Untitled")
+    end
+    local chars = util.splitToChars(title)
+    if #chars <= 48 then
+        return title
+    end
+    return table.concat(chars, "", 1, 45) .. "…"
+end
+
 function Instapaper:runBulkDownload(folder_id, days_limit, archive_after, delete_after)
-    UIManager:show(InfoMessage:new{
-        text = _("Fetching article list..."),
-        timeout = 1,
-    })
+    local Trapper = require("ui/trapper")
+    -- The whole run happens inside a Trapper coroutine so that Trapper:info()
+    -- can repaint between articles and let the user abort; without it the
+    -- download loop blocks the UI event loop and the device looks frozen.
+    Trapper:wrap(function()
+        Trapper:info(_("Fetching article list..."))
 
-    local params = { limit = "500" }  -- bulk always fetches max
-    if folder_id then
-        params.folder_id = folder_id
-    end
+        local params = { limit = "500" }  -- bulk always fetches max
+        if folder_id then
+            params.folder_id = folder_id
+        end
 
-    local ok, body, code = self:apiRequest("/api/1/bookmarks/list", params)
-    if not ok then
-        UIManager:show(InfoMessage:new{
-            text = T(_("Failed to fetch articles: %1"), body or tostring(code)),
-        })
-        return
-    end
+        local ok, body, code = self:apiRequest("/api/1/bookmarks/list", params)
+        if not ok then
+            Trapper:clear()
+            UIManager:show(InfoMessage:new{
+                text = T(_("Failed to fetch articles: %1"), body or tostring(code)),
+            })
+            return
+        end
 
-    local parse_ok, data = pcall(JSON.decode, body)
-    if not parse_ok or type(data) ~= "table" then
-        UIManager:show(InfoMessage:new{
-            text = _("Failed to parse article list."),
-        })
-        return
-    end
+        local parse_ok, data = pcall(JSON.decode, body)
+        if not parse_ok or type(data) ~= "table" then
+            Trapper:clear()
+            UIManager:show(InfoMessage:new{
+                text = _("Failed to parse article list."),
+            })
+            return
+        end
 
-    local bookmarks = {}
-    for _, item in ipairs(data) do
-        if type(item) == "table" and item.type == "bookmark" then
-            -- Apply days filter (client-side)
-            local include = true
-            if days_limit and days_limit > 0 then
-                local cutoff = os.time() - (days_limit * 86400)
-                if not item.time or item.time < cutoff then
-                    include = false
+        local bookmarks = {}
+        for _, item in ipairs(data) do
+            if type(item) == "table" and item.type == "bookmark" then
+                -- Apply days filter (client-side)
+                local include = true
+                if days_limit and days_limit > 0 then
+                    local cutoff = os.time() - (days_limit * 86400)
+                    if not item.time or item.time < cutoff then
+                        include = false
+                    end
+                end
+                if include then
+                    table.insert(bookmarks, item)
                 end
             end
-            if include then
-                table.insert(bookmarks, item)
-            end
         end
-    end
 
-    if #bookmarks == 0 then
-        UIManager:show(InfoMessage:new{
-            text = _("No articles match the selected filters."),
-        })
-        return
-    end
+        if #bookmarks == 0 then
+            Trapper:clear()
+            UIManager:show(InfoMessage:new{
+                text = _("No articles match the selected filters."),
+            })
+            return
+        end
 
-    -- Download sequentially, show progress
-    local downloaded = 0
-    local failed = 0
-    for _, bm in ipairs(bookmarks) do
-        local html, err = self:fetchArticleHtml(bm)
-        if html then
-            local saved = self:saveArticle(bm, html)
-            if saved then
-                downloaded = downloaded + 1
-                -- Archive or delete after successful download
-                if archive_after then
-                    self:apiRequest("/api/1/bookmarks/archive", {
-                        bookmark_id = tostring(bm.bookmark_id),
-                    })
-                elseif delete_after then
-                    self:apiRequest("/api/1/bookmarks/delete", {
-                        bookmark_id = tostring(bm.bookmark_id),
-                    })
+        -- Download sequentially, reporting progress between articles.
+        -- setPausedText writes to Trapper's singleton state, so the exit below
+        -- must reset() (not just clear()) or this text leaks into every other
+        -- Trapper user for the rest of the session.
+        Trapper:setPausedText(_("Bulk download paused."), _("Abort"), _("Continue"))
+        local total      = #bookmarks
+        local downloaded = 0
+        local failed     = 0
+        local aborted    = false
+        local started_at = os.time()
+
+        for i, bm in ipairs(bookmarks) do
+            -- Estimate remaining time from the articles done so far.
+            local eta = ""
+            if i > 1 then
+                local per_article = (os.time() - started_at) / (i - 1)
+                local minutes_left = math.ceil(per_article * (total - i + 1) / 60)
+                if minutes_left > 0 then
+                    eta = "\n" .. T(_("about %1 min left"), tostring(minutes_left))
+                end
+            end
+            -- Returns false when the user dismisses the message and confirms Abort.
+            local go_on = Trapper:info(T(_("Downloading %1 / %2\n%3%4"),
+                tostring(i), tostring(total), shortenForProgress(bm.title), eta))
+            if not go_on then
+                aborted = true
+                break
+            end
+
+            local html, err = self:fetchArticleHtml(bm)
+            if html then
+                local saved = self:saveArticle(bm, html)
+                if saved then
+                    downloaded = downloaded + 1
+                    -- Archive or delete after successful download
+                    if archive_after then
+                        self:apiRequest("/api/1/bookmarks/archive", {
+                            bookmark_id = tostring(bm.bookmark_id),
+                        })
+                    elseif delete_after then
+                        self:apiRequest("/api/1/bookmarks/delete", {
+                            bookmark_id = tostring(bm.bookmark_id),
+                        })
+                    end
+                else
+                    failed = failed + 1
                 end
             else
+                logger.warn("Instapaper bulk: failed to download", bm.bookmark_id, err)
                 failed = failed + 1
             end
-        else
-            logger.warn("Instapaper bulk: failed to download", bm.bookmark_id, err)
-            failed = failed + 1
         end
-    end
 
-    local msg = T(_("Bulk download complete.\nDownloaded: %1  Failed: %2"),
-        tostring(downloaded), tostring(failed))
-    UIManager:show(InfoMessage:new{
-        text = msg,
-    })
+        Trapper:reset()
+
+        local msg
+        if aborted then
+            msg = T(_("Bulk download aborted.\nDownloaded: %1  Failed: %2  Left: %3"),
+                tostring(downloaded), tostring(failed),
+                tostring(total - downloaded - failed))
+        else
+            msg = T(_("Bulk download complete.\nDownloaded: %1  Failed: %2"),
+                tostring(downloaded), tostring(failed))
+        end
+        UIManager:show(InfoMessage:new{
+            text = msg,
+        })
+    end)
 end
 
 --------------------------------------------------------------------
@@ -1768,10 +1828,15 @@ function Instapaper:drainPendingQueue(opts)
         local stopped_for_network = false
         local last_err
         
-        for _, item in ipairs(pending) do
+        for i, item in ipairs(pending) do
             if stopped_for_network then
                 table.insert(remaining, item)
             else
+                -- Background drains stay quiet; an explicit drain reports progress.
+                if not opts.silent then
+                    Trapper:info(T(_("Sending pending URL %1 / %2"),
+                        tostring(i), tostring(#pending)))
+                end
                 local ok = self:addBookmark(item.url, item.title)
                 if ok then
                     success_count = success_count + 1
@@ -1790,7 +1855,8 @@ function Instapaper:drainPendingQueue(opts)
         
         self:savePendingUrls(remaining)
         self._draining = false
-        
+        Trapper:clear()
+
         if opts.silent then return end
         if success_count == 0 and fail_count == 0 then return end
         
