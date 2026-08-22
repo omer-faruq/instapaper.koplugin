@@ -93,6 +93,263 @@ local function isTinyImage(tag)
 end
 
 --------------------------------------------------------------------
+-- Metadata helpers
+--
+-- Everything below derives metadata from bytes we have already downloaded
+-- (the article HTML and its images). Nothing here ever issues an extra HTTP
+-- request: Instapaper's API carries no author, excerpt or thumbnail field,
+-- and fetching the original page just to look for them would cost one full
+-- page load per article on a device that is often on slow/metered WiFi.
+--------------------------------------------------------------------
+
+local function collapseSpaces(s)
+    if not s or s == "" then return "" end
+    s = s:gsub("\194\160", " ") -- UTF-8 no-break space, not matched by %s
+    s = s:gsub("%s+", " ")
+    s = s:gsub("^%s+", ""):gsub("%s+$", "")
+    return s
+end
+
+local function stripTags(s)
+    return util.htmlEntitiesToUtf8((s or ""):gsub("<[^>]*>", " "))
+end
+
+-- Truncate to at most max_chars UTF-8 characters, backing off to a word
+-- boundary so the excerpt does not end mid-word.
+local function truncateText(text, max_chars)
+    local ok, chars = pcall(util.splitToChars, text)
+    if not ok or type(chars) ~= "table" or #chars <= max_chars then
+        return text
+    end
+    local truncated = table.concat(chars, "", 1, max_chars)
+    local cut = truncated:match("^(.*)%s%S*$")
+    if cut and #cut >= #truncated / 2 then
+        truncated = cut
+    end
+    -- Only ASCII punctuation here: %p would risk slicing a UTF-8 sequence.
+    truncated = truncated:gsub("[%s,;:%.%-]+$", "")
+    return truncated .. "\u{2026}"
+end
+
+-- Build a short plain-text excerpt from the article body we already have.
+-- Instapaper's own "description" field is user-supplied (the bookmarklet's
+-- text selection, or a source tweet) and is empty for most articles, so
+-- without this the book description stays blank.
+function InstapaperEpub.buildExcerpt(html, max_chars)
+    if type(html) ~= "string" or html == "" then return nil end
+    local body = html
+    local _, body_open_end = body:find("<body[^>]*>")
+    local body_close_start = body:find("</body>")
+    if body_open_end and body_close_start and body_close_start > body_open_end then
+        body = body:sub(body_open_end + 1, body_close_start - 1)
+    end
+    -- Headings and figure captions are labels, not prose: they would make the
+    -- excerpt read as a repetition of the title.
+    body = body:gsub("<[hH][1-6][^>]*>[%s%S]-</[hH][1-6]%s*>", " ")
+    body = body:gsub("<figcaption[^>]*>[%s%S]-</figcaption>", " ")
+    body = body:gsub("<figure[^>]*>[%s%S]-</figure>", " ")
+    local ok, text = pcall(util.htmlToPlainText, body)
+    if not ok or type(text) ~= "string" then return nil end
+    text = collapseSpaces(text)
+    if #text < 40 then return nil end
+    return util.fixUtf8(truncateText(text, max_chars or 320), "")
+end
+
+-- Reject anything that does not read like a person's name. Bylines are the
+-- one piece of metadata we can only guess at, so a wrong guess (a date, a
+-- section name, a URL) is worse than no author at all.
+local function sanitizeAuthor(raw)
+    local s = collapseSpaces(stripTags(raw))
+    s = s:gsub("^[Bb][Yy][%s:]+", ""):gsub("^[Ww]ritten%s+[Bb][Yy][%s:]+", "")
+    s = collapseSpaces(s)
+    if s == "" or #s > 80 then return nil end
+    if s:find("http", 1, true) or s:find("@", 1, true) or s:find("|", 1, true) then return nil end
+    if s:find("%d%d%d%d") then return nil end -- a year: this is a date line
+    local words = 0
+    for _ in s:gmatch("%S+") do words = words + 1 end
+    if words > 6 then return nil end
+    return util.fixUtf8(s, "")
+end
+
+-- Best-effort byline, read only from markup Instapaper's text view happens to
+-- keep. Usually returns nil, and that is fine: the site name below is always
+-- available, and guessing harder would mean downloading the original page.
+function InstapaperEpub.extractAuthor(html)
+    if type(html) ~= "string" or html == "" then return nil end
+    local head = html:sub(1, 20000)
+    for tag in head:gmatch("<[Mm][Ee][Tt][Aa][^>]*>") do
+        local key = tag:match('[Nn]ame%s*=%s*"([^"]*)"') or tag:match("[Nn]ame%s*=%s*'([^']*)'")
+                 or tag:match('[Pp]roperty%s*=%s*"([^"]*)"') or tag:match("[Pp]roperty%s*=%s*'([^']*)'")
+        if key and (key:lower() == "author" or key:lower() == "article:author") then
+            local content = tag:match('[Cc]ontent%s*=%s*"([^"]*)"')
+                         or tag:match("[Cc]ontent%s*=%s*'([^']*)'")
+            local author = content and sanitizeAuthor(content)
+            if author then return author end
+        end
+    end
+    -- Explicitly marked-up bylines only (rel/itemprop). Class-name guessing
+    -- ("byline", "author") matches too much boilerplate to be trustworthy.
+    for _, pattern in ipairs({
+        '<%a+[^>]-itemprop%s*=%s*["\']author["\'][^>]*>([%s%S]-)</',
+        '<%a+[^>]-rel%s*=%s*["\']author["\'][^>]*>([%s%S]-)</',
+    }) do
+        local inner = head:match(pattern)
+        local author = inner and sanitizeAuthor(inner)
+        if author then return author end
+    end
+    return nil
+end
+
+-- Site name, e.g. "https://www.example.com/a/b.html" -> "example.com".
+function InstapaperEpub.deriveSiteName(url)
+    if not url or url == "" then return nil end
+    local domain = url:match("^https?://([^/]+)")
+    if not domain then return nil end
+    domain = domain:gsub("^www%.", "")
+    if domain == "" then return nil end
+    return domain
+end
+
+--------------------------------------------------------------------
+-- Cover selection
+--------------------------------------------------------------------
+
+-- Read pixel dimensions straight out of the bytes already in memory.
+-- Returns width, height, or nil for formats we cannot parse cheaply.
+local function imageDimensions(data, mimetype)
+    if type(data) ~= "string" then return nil end
+    if mimetype == "image/png" and #data >= 24 and data:sub(2, 4) == "PNG" then
+        local w1, w2, w3, w4, h1, h2, h3, h4 = data:byte(17, 24)
+        return ((w1 * 256 + w2) * 256 + w3) * 256 + w4,
+               ((h1 * 256 + h2) * 256 + h3) * 256 + h4
+    end
+    if mimetype == "image/gif" and #data >= 10 and data:sub(1, 3) == "GIF" then
+        local w1, w2, h1, h2 = data:byte(7, 10)
+        return w2 * 256 + w1, h2 * 256 + h1 -- little-endian
+    end
+    if mimetype == "image/jpeg" and #data >= 4
+            and data:byte(1) == 0xFF and data:byte(2) == 0xD8 then
+        local pos = 3
+        while pos + 8 <= #data do
+            if data:byte(pos) ~= 0xFF then
+                pos = pos + 1
+            else
+                local marker = data:byte(pos + 1)
+                -- Padding and standalone markers carry no length field.
+                if marker == 0xFF or marker == 0x01 or (marker >= 0xD0 and marker <= 0xD9) then
+                    pos = pos + 2
+                else
+                    local len = data:byte(pos + 2) * 256 + data:byte(pos + 3)
+                    if len < 2 then return nil end
+                    -- SOF0..SOF15, minus DHT (C4), JPG (C8) and DAC (CC).
+                    if marker >= 0xC0 and marker <= 0xCF
+                            and marker ~= 0xC4 and marker ~= 0xC8 and marker ~= 0xCC then
+                        local h1, h2, w1, w2 = data:byte(pos + 5, pos + 8)
+                        return w1 * 256 + w2, h1 * 256 + h2
+                    end
+                    pos = pos + 2 + len
+                end
+            end
+        end
+    end
+    return nil
+end
+
+-- Use the article's lead image as the EPUB cover. Only images already
+-- downloaded for the body are considered, so this costs no extra traffic.
+local function pickCoverIndex(images)
+    for i, img in ipairs(images) do
+        if img.mimetype ~= "image/svg+xml" then
+            local w, h = imageDimensions(img.content, img.mimetype)
+            if w and h then
+                local ratio = h > 0 and (w / h) or 0
+                -- Big enough to be an illustration, and not a banner strip.
+                if w >= 300 and h >= 200 and ratio >= 0.4 and ratio <= 3.0 then
+                    return i
+                end
+            elseif #img.content >= 30000 then
+                -- Format we cannot measure (webp...): weight stands in for size.
+                return i
+            end
+        end
+    end
+    return nil
+end
+
+--------------------------------------------------------------------
+-- Chapters from heading levels
+--------------------------------------------------------------------
+
+-- Give every heading an id and collect it as a TOC entry, so the EPUB carries
+-- a real navMap instead of a single "whole article" entry. One extra gsub over
+-- a body that already goes through a dozen of them.
+local function extractHeadings(body)
+    local entries = {}
+    local counter = 0
+    local rewritten = body:gsub("<[hH]([1-6])([^>]*)>([%s%S]-)</[hH]%1%s*>",
+        function(level, attrs, inner)
+            local text = collapseSpaces(stripTags(inner))
+            if text == "" then return nil end -- untouched: nothing to label it with
+            local id = attrs:match('[%s]id%s*=%s*"([^"]*)"')
+                    or attrs:match("[%s]id%s*=%s*'([^']*)'")
+            if not id or id == "" then
+                counter = counter + 1
+                id = string.format("toc%03d", counter)
+                attrs = attrs .. string.format(' id="%s"', id)
+            end
+            table.insert(entries, { level = tonumber(level), title = text, id = id })
+            return "<h" .. level .. attrs .. ">" .. inner .. "</h" .. level .. ">"
+        end)
+    return rewritten, entries
+end
+
+-- Map the heading levels actually used onto consecutive depths, so an article
+-- built out of <h2>/<h3> still starts at TOC depth 1.
+local function normalizeLevels(entries)
+    local used = {}
+    for _, e in ipairs(entries) do used[e.level] = true end
+    local sorted = {}
+    for level in pairs(used) do table.insert(sorted, level) end
+    table.sort(sorted)
+    local depth_of = {}
+    for i, level in ipairs(sorted) do depth_of[level] = i end
+    local max_depth = 0
+    for _, e in ipairs(entries) do
+        e.depth = depth_of[e.level]
+        if e.depth > max_depth then max_depth = e.depth end
+    end
+    return max_depth
+end
+
+local function buildNavMap(entries)
+    local parts = {}
+    local play = 0
+    local open = 0 -- navPoints currently left open
+    local function indent(n) return string.rep("  ", n + 2) end
+    for _, e in ipairs(entries) do
+        -- Never skip a level: <h1> followed by <h3> must not produce a hole.
+        local depth = math.min(e.depth, open + 1)
+        while open >= depth do
+            table.insert(parts, indent(open - 1) .. "</navPoint>\n")
+            open = open - 1
+        end
+        play = play + 1
+        local pad = indent(depth - 1)
+        table.insert(parts, string.format(
+            '%s<navPoint id="navpoint-%d" playOrder="%d">\n'
+            .. '%s  <navLabel><text>%s</text></navLabel>\n'
+            .. '%s  <content src="content.xhtml#%s"/>\n',
+            pad, play, play, pad, xmlEsc(e.title), pad, xmlEsc(e.id)))
+        open = depth
+    end
+    while open > 0 do
+        table.insert(parts, indent(open - 1) .. "</navPoint>\n")
+        open = open - 1
+    end
+    return table.concat(parts)
+end
+
+--------------------------------------------------------------------
 -- HTML → EPUB image rewriting
 --------------------------------------------------------------------
 
@@ -127,8 +384,10 @@ local function rewriteImages(html, base_url)
             return '<img src="' .. seen[abs_src] .. '" alt="' .. alt .. '"/>'
         end
 
-        local ext = abs_src:match("%.([%w]+)%??") or ""
-        ext = ext:lower()
+        -- Extension of the last path segment only: matching the first dot in
+        -- the whole URL turns "//www.example.com/a.jpg" into ext "example".
+        local url_path = abs_src:match("^[^?#]*") or abs_src
+        local ext = (url_path:match("%.([%w]+)$") or ""):lower()
 
         local imgid = string.format("img%05d", imagenum)
         imagenum = imagenum + 1
@@ -218,6 +477,11 @@ function InstapaperEpub.createEpub(bookmark, html, download_dir, include_images)
     html = html:gsub("<script[^>]*>[%s%S]-</script>", "")
     html = html:gsub("<style[^>]*>[%s%S]-</style>", "")
 
+    -- Metadata we can only read off the original markup, before it is trimmed
+    -- down to the body below.
+    local author_str = InstapaperEpub.extractAuthor(html)
+    local excerpt_str = InstapaperEpub.buildExcerpt(html)
+
     -- Balance HTML tags using crengine if available
     local ok_cre, cre = pcall(require, "libs/libkoreader-cre")
     if ok_cre and cre then
@@ -264,6 +528,11 @@ function InstapaperEpub.createEpub(bookmark, html, download_dir, include_images)
     body_content = body_content:gsub("(<code[^>]*>)(.-)(</code>)", escapeCodeBlock)
     body_content = body_content:gsub("(<pre[^>]*>)(.-)(</pre>)",   escapeCodeBlock)
 
+    -- Turn the article's own heading levels into chapters (anchors + navMap).
+    local toc_entries
+    body_content, toc_entries = extractHeadings(body_content)
+    local toc_depth = normalizeLevels(toc_entries)
+
     -- Wrap in minimal XHTML (no external DTD to avoid crengine render errors)
     html = '<?xml version="1.0" encoding="utf-8"?>\n'
         .. '<html xmlns="http://www.w3.org/1999/xhtml"><head>'
@@ -302,16 +571,30 @@ function InstapaperEpub.createEpub(bookmark, html, download_dir, include_images)
 </container>]], mtime)
 
     -- OEBPS/content.opf
-    local author_str = article_url:match("^https?://([^/]+)")
-    if author_str then author_str = author_str:gsub("^www%.", "") end
-    local desc_str = (bookmark.description ~= nil and bookmark.description ~= "") and bookmark.description or nil
+    -- crengine joins several dc:creator entries with newlines, and KOReader's
+    -- book information renders them one per line, so byline and source site
+    -- can both be shown without a publisher field (which KOReader never reads).
+    local site_str = InstapaperEpub.deriveSiteName(article_url)
+    -- Instapaper's description is user-supplied and usually empty; fall back
+    -- to the excerpt we built from the article text itself.
+    local desc_str = (bookmark.description ~= nil and bookmark.description ~= "")
+        and bookmark.description or excerpt_str
 
     local meta_extra = ""
     if author_str then
         meta_extra = meta_extra .. "    <dc:creator>" .. xmlEsc(author_str) .. "</dc:creator>\n"
     end
+    if site_str then
+        meta_extra = meta_extra .. "    <dc:creator>" .. xmlEsc(site_str) .. "</dc:creator>\n"
+    end
     if desc_str then
         meta_extra = meta_extra .. "    <dc:description>" .. xmlEsc(desc_str) .. "</dc:description>\n"
+    end
+    -- Lead image as cover. crengine only looks at <meta name="cover">, so no
+    -- cover page or guide entry is needed.
+    local cover_idx = include_images and pickCoverIndex(images) or nil
+    if cover_idx then
+        meta_extra = meta_extra .. string.format('    <meta name="cover" content="img%05d"/>\n', cover_idx)
     end
 
     local opf_parts = {}
@@ -351,25 +634,35 @@ function InstapaperEpub.createEpub(bookmark, html, download_dir, include_images)
     epub:addFileFromMemory("OEBPS/stylesheet.css", "/* Instapaper */\n", mtime)
 
     -- OEBPS/toc.ncx
+    local nav_map, ncx_depth
+    if #toc_entries > 0 then
+        nav_map = buildNavMap(toc_entries)
+        ncx_depth = toc_depth
+    else
+        -- No headings in the article: keep the single whole-article entry.
+        nav_map = string.format([[
+    <navPoint id="navpoint-1" playOrder="1">
+      <navLabel><text>%s</text></navLabel>
+      <content src="content.xhtml"/>
+    </navPoint>
+]], escaped_title)
+        ncx_depth = 1
+    end
     local toc_ncx = string.format([[
 <?xml version='1.0' encoding='utf-8'?>
 <!DOCTYPE ncx PUBLIC "-//NISO//DTD ncx 2005-1//EN" "http://www.daisy.org/z3986/2005/ncx-2005-1.dtd">
 <ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">
   <head>
     <meta name="dtb:uid" content="instapaper_article"/>
-    <meta name="dtb:depth" content="1"/>
+    <meta name="dtb:depth" content="%d"/>
     <meta name="dtb:totalPageCount" content="0"/>
     <meta name="dtb:maxPageNumber" content="0"/>
   </head>
   <docTitle><text>%s</text></docTitle>
   <navMap>
-    <navPoint id="navpoint-1" playOrder="1">
-      <navLabel><text>%s</text></navLabel>
-      <content src="content.xhtml"/>
-    </navPoint>
-  </navMap>
+%s  </navMap>
 </ncx>
-]], escaped_title, escaped_title)
+]], ncx_depth, escaped_title, nav_map)
     epub:addFileFromMemory("OEBPS/toc.ncx", toc_ncx, mtime)
 
     -- OEBPS/content.xhtml

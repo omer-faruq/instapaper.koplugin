@@ -1047,24 +1047,15 @@ function Instapaper:injectTitleIfMissing(html, bookmark)
         return html
     end
     local escaped = title:gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;")
-    local inject = "<h3>" .. escaped .. "</h3>\n"
+    -- <h1>, not a smaller heading: the EPUB builder turns heading levels into
+    -- chapters, and the article title has to sit at the top of that hierarchy.
+    local inject = "<h1>" .. escaped .. "</h1>\n"
     -- Insert after <body> tag if present, otherwise prepend
     local result, n = html:gsub("(<body[^>]*>)", "%1\n" .. inject, 1)
     if n == 0 then
         result = inject .. html
     end
     return result
-end
-
--- Derive author/origin from the article URL's host, e.g.
--- "https://www.example.com/a/b.html" -> "example.com".
-function Instapaper:deriveAuthorFromUrl(url)
-    if not url or url == "" then return nil end
-    local domain = url:match("^https?://([^/]+)")
-    if not domain then return nil end
-    domain = domain:gsub("^www%.", "")
-    if domain == "" then return nil end
-    return domain
 end
 
 -- Write KOReader's own metadata sidecar (custom_metadata.lua) for a downloaded
@@ -1074,14 +1065,29 @@ end
 -- This is needed because crengine only reads <title> from plain HTML; it does
 -- not extract author/description from HTML <meta> tags (EPUB gets these from the
 -- OPF instead). custom_props override whatever the engine extracts.
-function Instapaper:writeBookMetadata(filepath, bookmark)
+function Instapaper:writeBookMetadata(filepath, bookmark, html)
     if not filepath then return end
 
+    local InstapaperEpub = require("instapaper_epub")
     local title = bookmark.title
     if title == "" then title = nil end
-    local authors = self:deriveAuthorFromUrl(bookmark.url)
+
+    -- Byline (when the article markup happens to carry one) above the source
+    -- site, matching how crengine reports several dc:creator entries in EPUBs.
+    local site = InstapaperEpub.deriveSiteName(bookmark.url)
+    local author = html and InstapaperEpub.extractAuthor(html) or nil
+    local authors
+    if author and site then
+        authors = author .. "\n" .. site
+    else
+        authors = author or site
+    end
+
     local description = bookmark.description
     if description == "" then description = nil end
+    if not description and html then
+        description = InstapaperEpub.buildExcerpt(html)
+    end
 
     if not (title or authors or description) then return end
 
@@ -1155,7 +1161,7 @@ function Instapaper:saveArticle(bookmark, html)
     -- EPUB carries its metadata in the OPF (read natively by crengine), so we
     -- only need the KOReader metadata sidecar for HTML output.
     if is_html then
-        self:writeBookMetadata(filepath, bookmark)
+        self:writeBookMetadata(filepath, bookmark, html)
     end
     return filepath
 end

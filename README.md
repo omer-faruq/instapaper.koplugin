@@ -8,12 +8,15 @@ Download and read articles from your Instapaper account directly in KOReader.
 - Browse **Unread**, **Starred**, **Archived**, and **custom folders**
 - **Download and read** articles as HTML or EPUB in KOReader's built-in reader
 - **EPUB output** — articles can be saved as EPUB files with optional image inclusion
+- **Book metadata** — byline (when the article markup carries one) and source site as authors, plus an auto-generated excerpt as the book description
+- **Cover image** — the article's lead image becomes the book cover (EPUB, when images are included)
+- **Chapters from headings** — the article's `<h1>`–`<h6>` levels become a nested table of contents in the EPUB
 - **Download only** (long-press → Download) without leaving the list — enables multi-article downloads
 - **Article info on long-press**: date saved, word count, estimated reading time, progress, and source URL
 - **Manage articles**: Archive, Delete, Star (via long-press)
 - **Bulk download** with folder, time period, and post-download action (archive/delete/none)
 - **Auto WiFi connect** — triggers network connection automatically when needed
-- **Title injection** — missing article titles are added as a heading in the downloaded HTML
+- **Title injection** — missing article titles are added as a top-level heading in the downloaded HTML
 - **Reading progress** display (percentage read)
 - **Configurable article list limit** — fetch up to 10, 25, 50, 100, 200, or 500 articles at once
 - **Send to Instapaper** — Add web links to Instapaper directly from document link popups
@@ -179,6 +182,37 @@ This plugin uses the **Instapaper Full API** (OAuth 1.0a):
 - **`/api/1/bookmarks/delete`** — Delete an article
 - **`/api/1/bookmarks/star`** — Star an article
 - **`/api/1/folders/list`** — Fetch user-created folders
+
+### Book Metadata
+
+The Instapaper API returns only `bookmark_id`, `url`, `title`, `description`,
+`hash`, `time`, `progress`, `progress_timestamp`, `starred` and
+`private_source` per bookmark. There is **no author, no excerpt and no
+thumbnail field**, so everything below is derived from bytes the plugin has
+already downloaded — no article ever costs an extra HTTP request for metadata:
+
+- **Authors** — the source site (from the URL host) is always written. If the
+  text-view HTML happens to carry a `<meta name="author">`, `article:author`,
+  `rel="author"` or `itemprop="author"`, that byline is written above it. Two
+  `dc:creator` entries: crengine joins them with a newline and KOReader's book
+  information shows one per line. Guesses that look like a date, a URL or a
+  sentence are dropped — no author is better than a wrong one.
+- **Description** — Instapaper's own `description` is user-supplied (the
+  bookmarklet's text selection, or a source tweet) and is empty for most
+  articles, so it falls back to a ~320-character excerpt built from the
+  article's first paragraphs, with headings and figure captions removed.
+- **Cover** — the article's lead image, picked from the images already
+  downloaded for the body: the first one at least 300×200 with a sane aspect
+  ratio, measured by reading PNG/GIF/JPEG headers straight out of memory. Only
+  applies to EPUB output with images enabled. Instapaper's own thumbnail is not
+  reachable through the API.
+- **Chapters** — `<h1>`–`<h6>` in the article get anchors, and the NCX gets a
+  nested navMap pointing at them. Heading levels are normalized, so an article
+  built out of `<h2>`/`<h3>` still starts at TOC depth 1.
+
+For HTML output the same values are written to KOReader's metadata sidecar
+instead (`custom_metadata.lua`), since crengine only reads `<title>` from plain
+HTML. Cover and chapters are EPUB-only.
 
 ### Offline Queue
 - Pending links are stored in `settings/instapaper_pending.lua`
