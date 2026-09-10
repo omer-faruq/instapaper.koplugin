@@ -19,6 +19,7 @@ local util = require("util")
 local _ = require("gettext")
 local T = FFIUtil.template
 local Dispatcher = require("dispatcher")
+local Event = require("ui/event")
 
 local base64_encode = require("mime").b64
 local sha2 = require("ffi/sha2")
@@ -222,21 +223,55 @@ function Instapaper:init()
 end
 
 function Instapaper:onReaderReady()
-    if self:countPending() > 0 then
-        local NetworkMgr = require("ui/network/manager")
-        if NetworkMgr:isOnline() then
-            UIManager:scheduleIn(2, function()
+    -- Reader modules have finished loading their normal sidecar position at this
+    -- point. Apply a newer Instapaper position on the next UI tick.
+    UIManager:nextTick(function()
+        self:restoreRemoteReadingProgress()
+    end)
+
+    if NetworkMgr:isOnline() then
+        UIManager:scheduleIn(2, function()
+            if self:countPending() > 0 then
                 self:drainPendingQueue({ silent = true })
-            end)
-        end
+            end
+            self:drainProgressQueue()
+        end)
     end
 end
 
 function Instapaper:onNetworkConnected()
-    if self:countPending() == 0 then return end
     UIManager:scheduleIn(1, function()
-        self:drainPendingQueue({ silent = false })
+        -- If an Instapaper article is currently open, include its current
+        -- position in the batch that is about to be sent.
+        self:captureCurrentReadingProgress(false)
+
+        if self:countPending() > 0 then
+            self:drainPendingQueue({ silent = false })
+        end
+        self:drainProgressQueue()
     end)
+end
+
+function Instapaper:onResume()
+    -- A suspend may have queued progress while Wi-Fi was unavailable or while
+    -- the device was going to sleep. Retry silently after resume if already
+    -- online; this never turns Wi-Fi on by itself.
+    if NetworkMgr:isOnline() then
+        UIManager:scheduleIn(1, function()
+            self:drainProgressQueue()
+        end)
+    end
+end
+
+function Instapaper:onSuspend()
+    -- Persist locally only. Avoid blocking suspend on a network request.
+    self:captureCurrentReadingProgress(false)
+end
+
+function Instapaper:onCloseDocument()
+    -- CloseDocument is emitted while the reader still exposes the live reading
+    -- position. Queue first, then send immediately only when already online.
+    self:captureCurrentReadingProgress(true)
 end
 
 function Instapaper:loadSettings()
@@ -271,6 +306,359 @@ function Instapaper:saveSettings()
     self.settings:saveSetting("cache_folder",       self.cache_folder)
     self.settings:saveSetting("auto_connect_network", self.auto_connect_network)
     self.settings:flush()
+end
+
+--------------------------------------------------------------------
+-- Reading progress sync
+--------------------------------------------------------------------
+
+-- Pending progress is stored in the existing Instapaper settings file.
+-- The table is keyed by bookmark_id, so only the newest unsent position for
+-- each article is retained.
+function Instapaper:getPendingProgress()
+    if not self.settings then
+        return {}
+    end
+    local pending = self.settings:readSetting("pending_progress")
+    if type(pending) ~= "table" then
+        return {}
+    end
+    return pending
+end
+
+function Instapaper:savePendingProgress(pending)
+    if not self.settings then
+        return
+    end
+    self.settings:saveSetting("pending_progress", pending or {})
+    self.settings:flush()
+end
+
+function Instapaper:queueReadingProgress(bookmark_id, progress, timestamp)
+    if bookmark_id == nil or progress == nil then
+        return
+    end
+
+    local key = tostring(bookmark_id)
+    local pending = self:getPendingProgress()
+    local previous = pending[key]
+    local previous_timestamp = type(previous) == "table"
+        and tonumber(previous.progress_timestamp or 0) or 0
+
+    if previous_timestamp <= timestamp then
+        pending[key] = {
+            bookmark_id = key,
+            progress = progress,
+            progress_timestamp = timestamp,
+        }
+        self:savePendingProgress(pending)
+    end
+end
+
+function Instapaper:removeQueuedReadingProgress(bookmark_id, timestamp)
+    local key = tostring(bookmark_id)
+    local pending = self:getPendingProgress()
+    local item = pending[key]
+
+    -- Do not remove a newer position that may have replaced the one just sent.
+    if type(item) == "table"
+            and tonumber(item.progress_timestamp or 0) <= timestamp then
+        pending[key] = nil
+        self:savePendingProgress(pending)
+    end
+end
+
+function Instapaper:sendReadingProgress(bookmark_id, progress, timestamp)
+    if not self:isLoggedIn() or not NetworkMgr:isOnline() then
+        return false
+    end
+
+    local call_ok, ok, body, code = pcall(
+        self.apiRequest,
+        self,
+        "/api/1/bookmarks/update_read_progress",
+        {
+            bookmark_id = tostring(bookmark_id),
+            progress = string.format("%.6f", progress),
+            progress_timestamp = tostring(timestamp),
+        }
+    )
+
+    if not call_ok then
+        logger.warn("Instapaper progress sync: request error", tostring(ok))
+        return false
+    end
+
+    if not ok then
+        logger.warn(
+            "Instapaper progress sync: update failed",
+            tostring(bookmark_id), tostring(code), tostring(body))
+        return false
+    end
+
+    return true
+end
+
+function Instapaper:drainProgressQueue()
+    if self._progress_queue_draining
+            or not self:isLoggedIn()
+            or not NetworkMgr:isOnline() then
+        return
+    end
+
+    local pending = self:getPendingProgress()
+    if next(pending) == nil then
+        return
+    end
+
+    self._progress_queue_draining = true
+
+    local ok, err = pcall(function()
+        local ids = {}
+        for bookmark_id in pairs(pending) do
+            ids[#ids + 1] = bookmark_id
+        end
+
+        for _, bookmark_id in ipairs(ids) do
+            if not NetworkMgr:isOnline() then
+                break
+            end
+
+            -- Reload before every send in case the stored value changed.
+            local latest = self:getPendingProgress()[bookmark_id]
+            if type(latest) == "table" then
+                local progress = tonumber(latest.progress)
+                local timestamp = tonumber(latest.progress_timestamp)
+
+                if progress and timestamp then
+                    if self:sendReadingProgress(
+                            bookmark_id, progress, timestamp) then
+                        self:removeQueuedReadingProgress(
+                            bookmark_id, timestamp)
+                    else
+                        -- Retry the remaining entries on a later network event.
+                        break
+                    end
+                else
+                    -- Discard malformed queue entries rather than retrying them
+                    -- forever.
+                    local cleaned = self:getPendingProgress()
+                    cleaned[bookmark_id] = nil
+                    self:savePendingProgress(cleaned)
+                end
+            end
+        end
+    end)
+
+    self._progress_queue_draining = false
+
+    if not ok then
+        logger.warn("Instapaper progress sync: queue error", tostring(err))
+    end
+end
+
+function Instapaper:getCurrentInstapaperBookmarkId()
+    if not self.ui or not self.ui.doc_settings then
+        return nil
+    end
+
+    local ok, bookmark_id = pcall(
+        self.ui.doc_settings.readSetting,
+        self.ui.doc_settings,
+        "instapaper_bookmark_id"
+    )
+    if not ok or bookmark_id == nil or tostring(bookmark_id) == "" then
+        return nil
+    end
+
+    return tostring(bookmark_id)
+end
+
+function Instapaper:getCurrentReadingProgress()
+    if not self.ui or not self.ui.document then
+        return nil
+    end
+
+    local ok, progress = pcall(function()
+        local info = self.ui.document.info or {}
+
+        if info.has_pages then
+            if self.ui.paging and self.ui.paging.getLastPercent then
+                return self.ui.paging:getLastPercent()
+            end
+        else
+            if self.ui.rolling and self.ui.rolling.getLastPercent then
+                return self.ui.rolling:getLastPercent()
+            end
+        end
+
+        return nil
+    end)
+
+    if not ok then
+        logger.warn(
+            "Instapaper progress sync: could not read position",
+            tostring(progress))
+        return nil
+    end
+
+    progress = tonumber(progress)
+    if not progress then
+        return nil
+    end
+
+    if progress < 0 then progress = 0 end
+    if progress > 1 then progress = 1 end
+    return progress
+end
+
+function Instapaper:saveCurrentLocalProgressTimestamp(timestamp)
+    if not self.ui or not self.ui.doc_settings then
+        return
+    end
+
+    local ok, err = pcall(function()
+        self.ui.doc_settings:saveSetting(
+            "instapaper_local_progress_timestamp",
+            timestamp
+        )
+        self.ui.doc_settings:flush()
+    end)
+
+    if not ok then
+        logger.warn(
+            "Instapaper progress sync: could not save local timestamp",
+            tostring(err))
+    end
+end
+
+function Instapaper:restoreRemoteReadingProgress()
+    if not self.ui or not self.ui.document or not self.ui.doc_settings then
+        return
+    end
+
+    local bookmark_id = self:getCurrentInstapaperBookmarkId()
+    if not bookmark_id then
+        return
+    end
+
+    local ok, remote_progress, remote_timestamp, local_timestamp = pcall(function()
+        return
+            self.ui.doc_settings:readSetting("instapaper_remote_progress"),
+            self.ui.doc_settings:readSetting("instapaper_remote_progress_timestamp"),
+            self.ui.doc_settings:readSetting("instapaper_local_progress_timestamp")
+    end)
+
+    if not ok then
+        logger.warn(
+            "Instapaper progress sync: could not read saved remote progress",
+            tostring(remote_progress))
+        return
+    end
+
+    remote_progress = tonumber(remote_progress)
+    remote_timestamp = tonumber(remote_timestamp) or 0
+    local_timestamp = tonumber(local_timestamp) or 0
+
+    if not remote_progress then
+        return
+    end
+
+    if remote_progress < 0 then remote_progress = 0 end
+    if remote_progress > 1 then remote_progress = 1 end
+
+    -- Normally timestamps decide which copy is newer. The fallback covers old
+    -- Instapaper records that carry progress but no usable progress timestamp.
+    local should_apply = remote_timestamp > local_timestamp
+        or (local_timestamp == 0
+            and remote_timestamp == 0
+            and remote_progress > 0)
+
+    if not should_apply then
+        return
+    end
+
+    -- KOReader's GotoPercent event expects 0..100, while Instapaper stores 0..1.
+    self.ui:handleEvent(Event:new("GotoPercent", remote_progress * 100))
+
+    -- Treat the pulled position as the local baseline. A later page turn/close
+    -- will get a newer os.time() value and can then be pushed back normally.
+    self:saveCurrentLocalProgressTimestamp(remote_timestamp)
+
+    logger.info(
+        "Instapaper progress sync: restored remote position",
+        bookmark_id, string.format("%.1f%%", remote_progress * 100))
+end
+
+function Instapaper:captureCurrentReadingProgress(send_if_online)
+    local bookmark_id = self:getCurrentInstapaperBookmarkId()
+    if not bookmark_id then
+        return
+    end
+
+    local progress = self:getCurrentReadingProgress()
+    if progress == nil then
+        return
+    end
+
+    local timestamp = os.time()
+
+    -- Remember when this device last produced a reading position. This is used
+    -- to decide whether a subsequently downloaded Instapaper position is newer.
+    self:saveCurrentLocalProgressTimestamp(timestamp)
+
+    -- Persist first so an interrupted request cannot lose the newest position.
+    self:queueReadingProgress(bookmark_id, progress, timestamp)
+
+    if send_if_online
+            and self:isLoggedIn()
+            and NetworkMgr:isOnline()
+            and self:sendReadingProgress(
+                bookmark_id, progress, timestamp) then
+        self:removeQueuedReadingProgress(bookmark_id, timestamp)
+    end
+end
+
+-- Store the remote bookmark id in KOReader's normal per-document sidecar.
+-- This lets the reader-side plugin recognise downloaded Instapaper documents
+-- without changing filenames or EPUB contents.
+function Instapaper:writeInstapaperDocumentIdentity(filepath, bookmark)
+    if not filepath
+            or type(bookmark) ~= "table"
+            or bookmark.bookmark_id == nil then
+        return
+    end
+
+    local ok, err = pcall(function()
+        local DocSettings = require("docsettings")
+        local doc_settings = DocSettings:open(filepath)
+        doc_settings:saveSetting(
+            "instapaper_bookmark_id",
+            tostring(bookmark.bookmark_id)
+        )
+
+        if bookmark.progress ~= nil then
+            doc_settings:saveSetting(
+                "instapaper_remote_progress",
+                tonumber(bookmark.progress) or 0
+            )
+        end
+
+        if bookmark.progress_timestamp ~= nil then
+            doc_settings:saveSetting(
+                "instapaper_remote_progress_timestamp",
+                tonumber(bookmark.progress_timestamp) or 0
+            )
+        end
+
+        doc_settings:flush()
+    end)
+
+    if not ok then
+        logger.warn(
+            "Instapaper progress sync: could not write document identity for",
+            tostring(filepath), tostring(err))
+    end
 end
 
 function Instapaper:isConfigured()
@@ -788,6 +1176,10 @@ function Instapaper:logout()
     self.oauth_token        = nil
     self.oauth_token_secret = nil
     self.username           = nil
+    -- Queued bookmark ids belong to the current Instapaper account.
+    if self.settings then
+        self.settings:saveSetting("pending_progress", {})
+    end
     self:saveSettings()
     UIManager:show(InfoMessage:new{
         text = _("Logged out."),
@@ -1158,6 +1550,12 @@ function Instapaper:saveArticle(bookmark, html)
     else
         filepath = self:saveArticleHtml(bookmark, html)
     end
+    -- Record the Instapaper bookmark id for both HTML and EPUB downloads so
+    -- reader-side progress can be associated with the correct remote article.
+    if filepath then
+        self:writeInstapaperDocumentIdentity(filepath, bookmark)
+    end
+
     -- EPUB carries its metadata in the OPF (read natively by crengine), so we
     -- only need the KOReader metadata sidecar for HTML output.
     if is_html then
