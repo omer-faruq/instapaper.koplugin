@@ -608,7 +608,12 @@ function Instapaper:captureCurrentReadingProgress(send_if_online)
     self:saveCurrentLocalProgressTimestamp(timestamp)
 
     -- Persist first so an interrupted request cannot lose the newest position.
-    self:queueReadingProgress(bookmark_id, progress, timestamp)
+    -- Skip queuing while logged out: pending_progress is account-scoped, and a
+    -- later login (possibly to a different account) must not inherit stale
+    -- entries that logout() already cleared.
+    if self:isLoggedIn() then
+        self:queueReadingProgress(bookmark_id, progress, timestamp)
+    end
 
     if send_if_online
             and self:isLoggedIn()
