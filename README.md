@@ -9,7 +9,7 @@ Download and read articles from your Instapaper account directly in KOReader.
 - **Download and read** articles as HTML or EPUB in KOReader's built-in reader
 - **EPUB output** — articles can be saved as EPUB files with optional image inclusion
 - **Book metadata** — byline (when the article markup carries one) and source site as authors, plus an auto-generated excerpt as the book description
-- **Cover image** — the article's lead image becomes the book cover (EPUB, when images are included)
+- **Cover image** — a designed cover is drawn for the book: title on top, the article's lead image in a landscape band in the middle, author at the bottom (EPUB; can be turned off, and falls back to the bare lead image)
 - **Chapters from headings** — the article's `<h1>`–`<h6>` levels become a nested table of contents in the EPUB
 - **Download only** (long-press → Download) without leaving the list — enables multi-article downloads
 - **Article info on long-press**: date saved, word count, estimated reading time, progress, and source URL
@@ -156,6 +156,7 @@ Select **Settings** from the Instapaper menu to configure:
 - **Article list limit** — Number of articles fetched per request: 10, 25, 50, 100, 200, or 500 (default: 50)
 - **Output format** — Save articles as **HTML** (default) or **EPUB**
 - **Include images (EPUB)** — When EPUB format is selected, optionally download and embed article images into the EPUB file (ON/OFF)
+- **Designed cover (EPUB)** — Draw a title/image/author cover instead of using the lead image as is (ON/OFF, default ON). With images off, the cover is still drawn, just without the picture
 - **After download** — Action to perform after downloading individual articles (tap or long-press → Download/Open):
   - **None** (default) — No action, article stays in its current folder
   - **Archive only** — Move article to Archive folder
@@ -201,11 +202,31 @@ already downloaded — no article ever costs an extra HTTP request for metadata:
   bookmarklet's text selection, or a source tweet) and is empty for most
   articles, so it falls back to a ~320-character excerpt built from the
   article's first paragraphs, with headings and figure captions removed.
-- **Cover** — the article's lead image, picked from the images already
-  downloaded for the body: the first one at least 300×200 with a sane aspect
-  ratio, measured by reading PNG/GIF/JPEG headers straight out of memory. Only
-  applies to EPUB output with images enabled. Instapaper's own thumbnail is not
-  reachable through the API.
+- **Cover** — the lead image is picked from the images already downloaded for
+  the body: the first one at least 300×200 with a sane aspect ratio, measured by
+  reading PNG/GIF/JPEG headers straight out of memory. Instapaper's own
+  thumbnail is not reachable through the API.
+
+  With **Designed cover** on, that image is not used as the cover directly.
+  Instead a 600×800 grayscale bitmap is painted — title (up to 4 lines), the
+  image filling a landscape band no taller than 320px, then the
+  author (up to 2 lines) with the source site in smaller type under it — and
+  stored as `images/cover.png`. The signature follows the EPUB metadata: when
+  the article carries no byline, the site takes the author slot instead of
+  leaving the cover unsigned. Title and author
+  fonts shrink until the widest word fits, and whatever still does not fit is
+  cut with an ellipsis, so long headlines and long bylines both stay inside the
+  page. The image is scaled to fill the band rather than fit inside it — the
+  aspect ratio is kept, small images are scaled up, and the overflow is cropped
+  off the long axis (centered horizontally, slightly above center vertically),
+  so the band is never left with empty margins. If anything goes wrong the plain
+  lead-image cover is used instead.
+
+  With no usable lead image the cover switches to a text-only layout rather than
+  leaving a hole in the middle: bigger type (title up to 72px over 8 lines,
+  byline up to 44px) and the whole block centered on the page. The title only
+  gets as many lines as the signature leaves room for, so nothing runs off the
+  page.
 - **Chapters** — `<h1>`–`<h6>` in the article get anchors, and the NCX gets a
   nested navMap pointing at them. Heading levels are normalized, so an article
   built out of `<h2>`/`<h3>` still starts at TOC depth 1.

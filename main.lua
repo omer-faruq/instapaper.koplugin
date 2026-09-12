@@ -285,6 +285,9 @@ function Instapaper:loadSettings()
     self.article_limit      = self.settings:readSetting("article_limit") or 50
     self.output_format      = self.settings:readSetting("output_format") or "html"
     self.include_images     = self.settings:readSetting("include_images") or false
+    -- Designed EPUB cover (title + lead image + author): on unless turned off.
+    local designed_cover    = self.settings:readSetting("designed_cover")
+    self.designed_cover     = (designed_cover == nil) and true or designed_cover
     self.after_download_action = self.settings:readSetting("after_download_action") or "none"
     self.cache_folder       = self.settings:readSetting("cache_folder")
     self.auto_connect_network = self.settings:readSetting("auto_connect_network")
@@ -302,6 +305,7 @@ function Instapaper:saveSettings()
     self.settings:saveSetting("article_limit",      self.article_limit)
     self.settings:saveSetting("output_format",      self.output_format)
     self.settings:saveSetting("include_images",     self.include_images)
+    self.settings:saveSetting("designed_cover",     self.designed_cover)
     self.settings:saveSetting("after_download_action", self.after_download_action)
     self.settings:saveSetting("cache_folder",       self.cache_folder)
     self.settings:saveSetting("auto_connect_network", self.auto_connect_network)
@@ -879,6 +883,8 @@ function Instapaper:showSettingsDialog()
 
     local output_format = self.output_format or "html"
     local include_images = self.include_images or false
+    local designed_cover = self.designed_cover
+    if designed_cover == nil then designed_cover = true end
     local after_download_action = self.after_download_action or "none"
     local cache_folder = self.cache_folder
     local auto_connect = self.auto_connect_network
@@ -895,6 +901,7 @@ function Instapaper:showSettingsDialog()
         local default_dir = DataStorage:getDataDir() .. "/instapaper"
         local fmt_label = output_format == "epub" and "EPUB" or "HTML"
         local img_label = include_images and _("ON") or _("OFF")
+        local cover_label = designed_cover and _("ON") or _("OFF")
         local limit_label = tostring(limit_choices[limit_idx])
         local action_label
         if after_download_action == "archive" then
@@ -923,6 +930,7 @@ function Instapaper:showSettingsDialog()
                 .. "\n" .. _("Article list limit: ") .. limit_label
                 .. "\n" .. _("Output format: ") .. fmt_label
                 .. "\n" .. _("Include images (EPUB): ") .. img_label
+                .. "\n" .. _("Designed cover (EPUB): ") .. cover_label
                 .. "\n" .. _("After download: ") .. action_label
                 .. "\n" .. _("Auto connect network: ") .. auto_label
                 .. "\n" .. _("Cache folder: ") .. cache_label,
@@ -967,6 +975,15 @@ function Instapaper:showSettingsDialog()
                 },
                 {
                     {
+                        text = _("Designed cover: ") .. cover_label,
+                        callback = function()
+                            designed_cover = not designed_cover
+                            rebuildSettingsDialog()
+                        end,
+                    },
+                },
+                {
+                    {
                         text = _("Auto connect: ") .. (auto_connect and _("ON") or _("OFF")),
                         callback = function()
                             auto_connect = not auto_connect
@@ -992,6 +1009,7 @@ function Instapaper:showSettingsDialog()
                             self.article_limit  = limit_choices[limit_idx]
                             self.output_format  = output_format
                             self.include_images = include_images
+                            self.designed_cover = designed_cover
                             self.after_download_action = after_download_action
                             self.auto_connect_network = auto_connect
                             self.cache_folder = cache_folder
@@ -1545,7 +1563,8 @@ function Instapaper:saveArticle(bookmark, html)
         local InstapaperEpub = require("instapaper_epub")
         local err
         filepath, err = InstapaperEpub.createEpub(
-            bookmark, html, self:getDownloadDir(), self.include_images)
+            bookmark, html, self:getDownloadDir(), self.include_images,
+            self.designed_cover)
         if filepath then
             is_html = false
         else

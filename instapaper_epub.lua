@@ -216,7 +216,7 @@ end
 
 -- Read pixel dimensions straight out of the bytes already in memory.
 -- Returns width, height, or nil for formats we cannot parse cheaply.
-local function imageDimensions(data, mimetype)
+function InstapaperEpub.imageDimensions(data, mimetype)
     if type(data) ~= "string" then return nil end
     if mimetype == "image/png" and #data >= 24 and data:sub(2, 4) == "PNG" then
         local w1, w2, w3, w4, h1, h2, h3, h4 = data:byte(17, 24)
@@ -260,7 +260,7 @@ end
 local function pickCoverIndex(images)
     for i, img in ipairs(images) do
         if img.mimetype ~= "image/svg+xml" then
-            local w, h = imageDimensions(img.content, img.mimetype)
+            local w, h = InstapaperEpub.imageDimensions(img.content, img.mimetype)
             if w and h then
                 local ratio = h > 0 and (w / h) or 0
                 -- Big enough to be an illustration, and not a banner strip.
@@ -457,7 +457,7 @@ end
 
 -- Create a standalone EPUB from Instapaper HTML.
 -- Returns filepath on success, nil + error string on failure.
-function InstapaperEpub.createEpub(bookmark, html, download_dir, include_images)
+function InstapaperEpub.createEpub(bookmark, html, download_dir, include_images, designed_cover)
     if type(html) ~= "string" or html == "" then
         return nil, "empty_html"
     end
@@ -590,10 +590,33 @@ function InstapaperEpub.createEpub(bookmark, html, download_dir, include_images)
     if desc_str then
         meta_extra = meta_extra .. "    <dc:description>" .. xmlEsc(desc_str) .. "</dc:description>\n"
     end
-    -- Lead image as cover. crengine only looks at <meta name="cover">, so no
-    -- cover page or guide entry is needed.
+    -- Cover. crengine only looks at <meta name="cover">, so no cover page or
+    -- guide entry is needed. With designed_cover we paint title + lead image +
+    -- author into a bitmap of our own; otherwise the lead image is used as is.
     local cover_idx = include_images and pickCoverIndex(images) or nil
-    if cover_idx then
+    local cover_png
+    if designed_cover then
+        local ok_cover, Cover = pcall(require, "instapaper_cover")
+        if ok_cover and Cover then
+            local lead
+            if cover_idx then
+                local img = images[cover_idx]
+                local iw, ih = InstapaperEpub.imageDimensions(img.content, img.mimetype)
+                lead = { content = img.content, mimetype = img.mimetype, w = iw, h = ih }
+            end
+            local err_cover
+            cover_png, err_cover = Cover.build(title, author_str, site_str, lead,
+                                               epub_path_tmp .. ".cover.png")
+            if not cover_png then
+                logger.info("InstapaperEpub: designed cover skipped", err_cover)
+            end
+        else
+            logger.info("InstapaperEpub: cover module unavailable", Cover)
+        end
+    end
+    if cover_png then
+        meta_extra = meta_extra .. '    <meta name="cover" content="cover"/>\n'
+    elseif cover_idx then
         meta_extra = meta_extra .. string.format('    <meta name="cover" content="img%05d"/>\n', cover_idx)
     end
 
@@ -612,6 +635,11 @@ function InstapaperEpub.createEpub(bookmark, html, download_dir, include_images)
     <item id="content" href="content.xhtml" media-type="application/xhtml+xml"/>
     <item id="css"     href="stylesheet.css" media-type="text/css"/>
 ]], escaped_title, meta_extra, Version:getCurrentRevision()))
+
+    if cover_png then
+        table.insert(opf_parts,
+            '    <item id="cover" href="images/cover.png" media-type="image/png"/>\n')
+    end
 
     if include_images then
         for i, img in ipairs(images) do
@@ -672,6 +700,10 @@ function InstapaperEpub.createEpub(bookmark, html, download_dir, include_images)
     collectgarbage()
 
     -- OEBPS/images/*
+    if cover_png then
+        epub:addFileFromMemory("OEBPS/images/cover.png", cover_png, true, mtime)
+        cover_png = nil
+    end
     if include_images then
         for _, img in ipairs(images) do
             epub:addFileFromMemory("OEBPS/" .. img.imgpath, img.content, img.no_compress, mtime)
