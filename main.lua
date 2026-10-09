@@ -23,6 +23,7 @@ local Event = require("ui/event")
 
 local base64_encode = require("mime").b64
 local sha2 = require("ffi/sha2")
+local V2 = require("instapaper_v2")
 
 --------------------------------------------------------------------
 -- OAuth 1.0a helpers
@@ -170,6 +171,273 @@ function Instapaper:apiRequest(endpoint, body_params, raw_response)
     return true, response_body, code
 end
 
+-- "HTTP 402: Instaparser free credit limit exceeded", or the network error.
+local function httpError(code, message)
+    code = tonumber(code) or 0
+    if code == 0 then
+        return message or "network error"
+    end
+    if message and message ~= "" then
+        return "HTTP " .. code .. ": " .. message
+    end
+    return "HTTP " .. code
+end
+
+-- Bearer-token request to the Instapaper API v2 (JSON in, JSON out).
+-- Returns ok, data (decoded JSON table or nil), http_code, error_message.
+function Instapaper:apiRequestV2(method, path, query, json_body)
+    local request_url = self.api_base .. "/api/2" .. path .. V2.buildQuery(query)
+    local headers = {
+        ["Authorization"] = "Bearer " .. (self.oauth_token or ""),
+        ["Accept"]        = "application/json",
+    }
+    local source
+    if json_body ~= nil then
+        local body = JSON.encode(json_body)
+        headers["Content-Type"]   = "application/json"
+        headers["Content-Length"] = tostring(#body)
+        source = ltn12.source.string(body)
+    elseif method == "POST" then
+        headers["Content-Length"] = "0"
+    end
+
+    local chunks = {}
+    socketutil:set_timeout(
+        socketutil.DEFAULT_BLOCK_TIMEOUT,
+        socketutil.DEFAULT_TOTAL_TIMEOUT)
+    local result, code = https.request{
+        url     = request_url,
+        method  = method,
+        headers = headers,
+        source  = source,
+        sink    = ltn12.sink.table(chunks),
+    }
+    socketutil:reset_timeout()
+
+    if result ~= 1 then
+        logger.warn("Instapaper v2: network error on", method, path, code)
+        return false, nil, 0, tostring(code)
+    end
+
+    local response_body = table.concat(chunks)
+    local data
+    if response_body ~= "" then
+        local ok_json, decoded = pcall(JSON.decode, response_body)
+        if ok_json and type(decoded) == "table" then
+            data = decoded
+        end
+    end
+
+    if type(code) ~= "number" or code < 200 or code >= 300 then
+        local message = V2.errorMessage(data)
+        logger.warn("Instapaper v2:", method, path, code, message)
+        if code == 401 and self:switchToV1AfterRejection() then
+            message = _("Instapaper API v2 did not accept this login, so the plugin switched back to API v1. Please try again.")
+        end
+        return false, data, code, message
+    end
+
+    if not self.v2_confirmed then
+        self.v2_confirmed = true
+        self.settings:saveSetting("v2_confirmed", true)
+        self.settings:flush()
+    end
+    return true, data, code
+end
+
+--------------------------------------------------------------------
+-- API version
+--------------------------------------------------------------------
+
+-- Logged in through xAuth: consumer credentials plus token and token secret,
+-- which is everything a signed v1 request needs.
+function Instapaper:hasV1Credentials()
+    return self:isConfigured()
+       and self.oauth_token        and self.oauth_token        ~= ""
+       and self.oauth_token_secret and self.oauth_token_secret ~= ""
+       and true or false
+end
+
+-- v2 is the default. v1 stays selectable (Settings → API) for xAuth logins, as
+-- a way back while v2 is new; a personal access token only works with v2.
+function Instapaper:usesV2()
+    return not (self.api_version == "v1" and self:hasV1Credentials())
+end
+
+-- Instapaper says tokens issued through xAuth work as v2 bearer tokens. If an
+-- account's token is turned away before v2 ever worked for it, fall back to
+-- v1 rather than leave an existing login broken. Returns true when it switched.
+function Instapaper:switchToV1AfterRejection()
+    if self.v2_confirmed or not self:hasV1Credentials() then
+        return false
+    end
+    logger.warn("Instapaper: v2 rejected the xAuth token, switching to API v1")
+    self.api_version = "v1"
+    self.settings:saveSetting("api_version", "v1")
+    self.settings:flush()
+    return true
+end
+
+--------------------------------------------------------------------
+-- API calls (v2, or v1 when selected)
+--------------------------------------------------------------------
+
+-- One page of a list. folder_id is the plugin's own list name: "unread",
+-- "starred", "archive" or a folder id. Returns ok, bookmarks|error, page_count.
+-- v1 has no offset: it always returns the first page.
+function Instapaper:apiListBookmarks(folder_id, limit, offset)
+    if self:usesV2() then
+        local query = V2.listParams(folder_id)
+        query.limit = tostring(limit)
+        if offset and offset > 0 then
+            query.offset = tostring(offset)
+        end
+        local ok, data, code, err = self:apiRequestV2("GET", "/bookmarks", query)
+        if not ok then
+            return false, httpError(code, err)
+        end
+        local bookmarks, page_count = V2.parseBookmarkList(data)
+        return true, bookmarks, page_count
+    end
+
+    local params = { limit = tostring(limit) }
+    if folder_id then
+        params.folder_id = folder_id
+    end
+    local ok, body, code = self:apiRequest("/api/1/bookmarks/list", params)
+    if not ok then
+        return false, httpError(code, body)
+    end
+    local parse_ok, data = pcall(JSON.decode, body)
+    if not parse_ok or type(data) ~= "table" then
+        return false, _("Failed to parse article list.")
+    end
+    -- /api/1/bookmarks/list returns array of objects, first is user info
+    local bookmarks = {}
+    for _, item in ipairs(data) do
+        if type(item) == "table" and item.type == "bookmark" then
+            table.insert(bookmarks, item)
+        end
+    end
+    return true, bookmarks, #bookmarks
+end
+
+-- Article HTML as a full document. Returns html, or nil + error.
+function Instapaper:apiGetArticleHtml(bookmark)
+    local id = tostring(bookmark.bookmark_id)
+    if self:usesV2() then
+        local ok, data, code, err = self:apiRequestV2("GET", "/bookmarks/" .. id .. "/parse")
+        if not ok then
+            return nil, httpError(code, err)
+        end
+        local html, author = V2.buildArticleHtml(data, bookmark)
+        if not html then
+            return nil, _("The article has no text.")
+        end
+        if author and not bookmark.author then
+            bookmark.author = author
+        end
+        if type(data) == "table" and type(data.content) == "table"
+                and data.content.paywalled == true then
+            logger.info("Instapaper: article looks paywalled, body may be a preview", id)
+        end
+        return html
+    end
+
+    local ok, html, code = self:apiRequest("/api/1/bookmarks/get_text", {
+        bookmark_id = id,
+    }, true)
+    if not ok then
+        return nil, httpError(code)
+    end
+    return html
+end
+
+local V1_ACTIONS = {
+    archive = "/api/1/bookmarks/archive",
+    delete  = "/api/1/bookmarks/delete",
+    star    = "/api/1/bookmarks/star",
+}
+
+-- "archive", "delete" or "star". Returns ok, error.
+function Instapaper:apiBookmarkAction(action, bookmark_id)
+    local id = tostring(bookmark_id)
+    if self:usesV2() then
+        local method, path, body
+        if action == "archive" then
+            method, path, body = "POST", "/bookmarks/" .. id .. "/move", { section = "archive" }
+        elseif action == "delete" then
+            method, path = "DELETE", "/bookmarks/" .. id
+        else -- star
+            method, path = "POST", "/bookmarks/" .. id .. "/like"
+        end
+        local ok, _d, code, err = self:apiRequestV2(method, path, nil, body)
+        return ok, (not ok) and httpError(code, err) or nil
+    end
+
+    local ok, body, code = self:apiRequest(V1_ACTIONS[action], { bookmark_id = id })
+    return ok, (not ok) and httpError(code, body) or nil
+end
+
+-- progress is 0..1. Returns ok, error.
+function Instapaper:apiSetProgress(bookmark_id, progress, timestamp)
+    local id = tostring(bookmark_id)
+    if self:usesV2() then
+        local ok, _d, code, err = self:apiRequestV2("POST", "/bookmarks/" .. id, nil, {
+            progress = { percentage = progress, timestamp = timestamp },
+        })
+        return ok, (not ok) and httpError(code, err) or nil
+    end
+
+    local ok, body, code = self:apiRequest("/api/1/bookmarks/update_read_progress", {
+        bookmark_id        = id,
+        progress           = string.format("%.6f", progress),
+        progress_timestamp = tostring(timestamp),
+    })
+    return ok, (not ok) and httpError(code, body) or nil
+end
+
+-- params: url, and optional title/description. Returns ok, error.
+function Instapaper:apiAddBookmark(params)
+    if self:usesV2() then
+        local ok, _d, code, err = self:apiRequestV2("POST", "/bookmarks", nil, params)
+        return ok, (not ok) and httpError(code, err) or nil
+    end
+
+    local ok, body, code = self:apiRequest("/api/1/bookmarks/add", params)
+    return ok, (not ok) and httpError(code, body) or nil
+end
+
+-- User-created folders as {text, value}, or nil + error.
+function Instapaper:apiListFolders()
+    if self:usesV2() then
+        local ok, data, code, err = self:apiRequestV2("GET", "/folders")
+        if not ok then
+            return nil, httpError(code, err)
+        end
+        return V2.parseFolders(data)
+    end
+
+    local ok, body, code = self:apiRequest("/api/1/folders/list", {})
+    if not ok then
+        return nil, httpError(code, body)
+    end
+    local parse_ok, data = pcall(JSON.decode, body)
+    if not parse_ok or type(data) ~= "table" then
+        return nil, _("Failed to parse folder list.")
+    end
+    local folders = {}
+    for _, item in ipairs(data) do
+        if type(item) == "table" and item.type == "folder" then
+            table.insert(folders, {
+                text  = item.title or item.slug or tostring(item.folder_id),
+                value = tostring(item.folder_id),
+            })
+        end
+    end
+    return folders
+end
+
 --------------------------------------------------------------------
 -- Profile Actions
 --------------------------------------------------------------------
@@ -282,6 +550,8 @@ function Instapaper:loadSettings()
     self.oauth_token        = self.settings:readSetting("oauth_token")
     self.oauth_token_secret = self.settings:readSetting("oauth_token_secret")
     self.username           = self.settings:readSetting("username")
+    self.api_version        = self.settings:readSetting("api_version") or "v2"
+    self.v2_confirmed       = self.settings:readSetting("v2_confirmed") or false
     self.article_limit      = self.settings:readSetting("article_limit") or 50
     self.output_format      = self.settings:readSetting("output_format") or "html"
     self.include_images     = self.settings:readSetting("include_images") or false
@@ -302,6 +572,8 @@ function Instapaper:saveSettings()
     self.settings:saveSetting("oauth_token",        self.oauth_token)
     self.settings:saveSetting("oauth_token_secret", self.oauth_token_secret)
     self.settings:saveSetting("username",           self.username)
+    self.settings:saveSetting("api_version",        self.api_version)
+    self.settings:saveSetting("v2_confirmed",       self.v2_confirmed)
     self.settings:saveSetting("article_limit",      self.article_limit)
     self.settings:saveSetting("output_format",      self.output_format)
     self.settings:saveSetting("include_images",     self.include_images)
@@ -377,16 +649,8 @@ function Instapaper:sendReadingProgress(bookmark_id, progress, timestamp)
         return false
     end
 
-    local call_ok, ok, body, code = pcall(
-        self.apiRequest,
-        self,
-        "/api/1/bookmarks/update_read_progress",
-        {
-            bookmark_id = tostring(bookmark_id),
-            progress = string.format("%.6f", progress),
-            progress_timestamp = tostring(timestamp),
-        }
-    )
+    local call_ok, ok, err = pcall(
+        self.apiSetProgress, self, bookmark_id, progress, timestamp)
 
     if not call_ok then
         logger.warn("Instapaper progress sync: request error", tostring(ok))
@@ -396,7 +660,7 @@ function Instapaper:sendReadingProgress(bookmark_id, progress, timestamp)
     if not ok then
         logger.warn(
             "Instapaper progress sync: update failed",
-            tostring(bookmark_id), tostring(code), tostring(body))
+            tostring(bookmark_id), tostring(err))
         return false
     end
 
@@ -670,15 +934,17 @@ function Instapaper:writeInstapaperDocumentIdentity(filepath, bookmark)
     end
 end
 
+-- Consumer key and secret: only needed for the email/password (xAuth) login
+-- and for v1 requests. A personal access token works without them.
 function Instapaper:isConfigured()
     return self.consumer_key    and self.consumer_key    ~= ""
        and self.consumer_secret and self.consumer_secret ~= ""
 end
 
+-- Any saved token counts: xAuth tokens work on both APIs, a personal access
+-- token (no token secret) on v2 only, and usesV2() routes accordingly.
 function Instapaper:isLoggedIn()
-    return self:isConfigured()
-       and self.oauth_token        and self.oauth_token        ~= ""
-       and self.oauth_token_secret and self.oauth_token_secret ~= ""
+    return self.oauth_token and self.oauth_token ~= "" and true or false
 end
 
 --------------------------------------------------------------------
@@ -789,15 +1055,7 @@ function Instapaper:addToMainMenu(menu_items)
                     if self:isLoggedIn() then
                         self:logout()
                     else
-                        if not self:isConfigured() then
-                            UIManager:show(InfoMessage:new{
-                                text = _("Please set API credentials first.\nGet them at: instapaper.com/main/request_oauth_consumer_token"),
-                            })
-                            return
-                        end
-                        NetworkMgr:runWhenOnline(function()
-                            self:showLoginDialog()
-                        end)
+                        self:showLoginMethodDialog()
                     end
                 end,
             },
@@ -808,7 +1066,7 @@ end
 function Instapaper:ensureOnlineAndLoggedIn(callback)
     if not self:isLoggedIn() then
         UIManager:show(InfoMessage:new{
-            text = _("Please configure API credentials and log in first."),
+            text = _("Please log in to Instapaper first."),
         })
         return
     end
@@ -848,11 +1106,17 @@ function Instapaper:showCredentialsDialog()
                     is_enter_default = true,
                     callback = function()
                         local fields = self.cred_dialog:getFields()
+                        local changed = fields[1] ~= (self.consumer_key or "")
+                                     or fields[2] ~= (self.consumer_secret or "")
                         self.consumer_key    = fields[1]
                         self.consumer_secret = fields[2]
-                        -- Invalidate tokens when credentials change
-                        self.oauth_token        = nil
-                        self.oauth_token_secret = nil
+                        -- An xAuth token is bound to the consumer credentials it
+                        -- was issued for; a personal access token is not.
+                        if changed and self.oauth_token_secret then
+                            self.oauth_token        = nil
+                            self.oauth_token_secret = nil
+                            self.v2_confirmed       = false
+                        end
                         self:saveSettings()
                         UIManager:close(self.cred_dialog)
                         UIManager:show(InfoMessage:new{
@@ -891,6 +1155,7 @@ function Instapaper:showSettingsDialog()
     if auto_connect == nil then
         auto_connect = true
     end
+    local api_version = self:usesV2() and "v2" or "v1"
 
     local settings_dialog
     local function rebuildSettingsDialog()
@@ -933,7 +1198,8 @@ function Instapaper:showSettingsDialog()
                 .. "\n" .. _("Designed cover (EPUB): ") .. cover_label
                 .. "\n" .. _("After download: ") .. action_label
                 .. "\n" .. _("Auto connect network: ") .. auto_label
-                .. "\n" .. _("Cache folder: ") .. cache_label,
+                .. "\n" .. _("Cache folder: ") .. cache_label
+                .. "\n" .. _("API: ") .. api_version,
             buttons = {
                 {
                     {
@@ -1003,6 +1269,21 @@ function Instapaper:showSettingsDialog()
                 },
                 {
                     {
+                        text = _("API: ") .. api_version,
+                        callback = function()
+                            if api_version == "v2" and not self:hasV1Credentials() then
+                                UIManager:show(InfoMessage:new{
+                                    text = _("API v1 needs an email and password login. An access token works with API v2 only."),
+                                })
+                                return
+                            end
+                            api_version = api_version == "v2" and "v1" or "v2"
+                            rebuildSettingsDialog()
+                        end,
+                    },
+                },
+                {
+                    {
                         text = _("Save"),
                         callback = function()
                             UIManager:close(settings_dialog)
@@ -1013,6 +1294,11 @@ function Instapaper:showSettingsDialog()
                             self.after_download_action = after_download_action
                             self.auto_connect_network = auto_connect
                             self.cache_folder = cache_folder
+                            if api_version ~= (self:usesV2() and "v2" or "v1") then
+                                self.api_version = api_version
+                                -- Choosing v2 by hand re-arms the fallback check.
+                                self.v2_confirmed = false
+                            end
                             self:saveSettings()
                             UIManager:show(InfoMessage:new{
                                 text = _("Settings saved."),
@@ -1106,6 +1392,95 @@ function Instapaper:showCacheFolderDialog(return_callback, current_folder)
     cache_dialog:onShowKeyboard()
 end
 
+function Instapaper:showLoginMethodDialog()
+    local method_dialog
+    method_dialog = ButtonDialog:new{
+        title = _("Instapaper login")
+            .. "\n\n" .. _("Access token: generate one at instapaper.com/developers/applications.")
+            .. "\n" .. _("Email and password: needs the API credentials, and stops working for new logins on 30 September 2027."),
+        buttons = {
+            {
+                {
+                    text = _("Access token"),
+                    callback = function()
+                        UIManager:close(method_dialog)
+                        NetworkMgr:runWhenOnline(function()
+                            self:showTokenDialog()
+                        end)
+                    end,
+                },
+            },
+            {
+                {
+                    text = _("Email and password"),
+                    callback = function()
+                        UIManager:close(method_dialog)
+                        if not self:isConfigured() then
+                            UIManager:show(InfoMessage:new{
+                                text = _("Email and password login needs API credentials first.\nGet them at: instapaper.com/developers/applications"),
+                            })
+                            return
+                        end
+                        NetworkMgr:runWhenOnline(function()
+                            self:showLoginDialog()
+                        end)
+                    end,
+                },
+            },
+            {
+                {
+                    text = _("Cancel"),
+                    callback = function()
+                        UIManager:close(method_dialog)
+                    end,
+                },
+            },
+        },
+    }
+    UIManager:show(method_dialog)
+end
+
+function Instapaper:showTokenDialog()
+    self.token_dialog = MultiInputDialog:new{
+        title = _("Instapaper access token"),
+        fields = {
+            {
+                text = "",
+                hint = _("Access token"),
+            },
+        },
+        buttons = {
+            {
+                {
+                    text = _("Cancel"),
+                    id = "close",
+                    callback = function()
+                        UIManager:close(self.token_dialog)
+                    end,
+                },
+                {
+                    text = _("Login"),
+                    is_enter_default = true,
+                    callback = function()
+                        local fields = self.token_dialog:getFields()
+                        UIManager:close(self.token_dialog)
+                        local token = util.trim(fields[1] or "")
+                        if token ~= "" then
+                            self:tokenLogin(token)
+                        else
+                            UIManager:show(InfoMessage:new{
+                                text = _("Access token is required."),
+                            })
+                        end
+                    end,
+                },
+            },
+        },
+    }
+    UIManager:show(self.token_dialog)
+    self.token_dialog:onShowKeyboard()
+end
+
 function Instapaper:showLoginDialog()
     self.login_dialog = MultiInputDialog:new{
         title = _("Instapaper login"),
@@ -1179,6 +1554,7 @@ function Instapaper:xauthLogin(username, password)
             self.oauth_token        = token
             self.oauth_token_secret = secret
             self.username           = username
+            self.v2_confirmed       = false
             self:saveSettings()
             UIManager:show(InfoMessage:new{
                 text = _("Login successful!"),
@@ -1195,10 +1571,41 @@ function Instapaper:xauthLogin(username, password)
     })
 end
 
+-- Personal access token: checked against GET /me, which also gives the
+-- username for the "Log out (name)" menu entry.
+function Instapaper:tokenLogin(token)
+    UIManager:show(InfoMessage:new{
+        text = _("Logging in..."),
+        timeout = 1,
+    })
+
+    local prev_t, prev_s, prev_c = self.oauth_token, self.oauth_token_secret, self.v2_confirmed
+    self.oauth_token, self.oauth_token_secret = token, nil
+    -- Not confirmed yet, but there is no v1 to fall back to without a secret.
+    self.v2_confirmed = false
+
+    local ok, data, code, err = self:apiRequestV2("GET", "/me")
+    if ok then
+        self.username = type(data) == "table" and V2.str(data.username) or nil
+        self:saveSettings()
+        UIManager:show(InfoMessage:new{
+            text = _("Login successful!"),
+            timeout = 2,
+        })
+        return
+    end
+
+    self.oauth_token, self.oauth_token_secret, self.v2_confirmed = prev_t, prev_s, prev_c
+    UIManager:show(InfoMessage:new{
+        text = T(_("Login failed (%1)"), httpError(code, err)),
+    })
+end
+
 function Instapaper:logout()
     self.oauth_token        = nil
     self.oauth_token_secret = nil
     self.username           = nil
+    self.v2_confirmed       = false
     -- Queued bookmark ids belong to the current Instapaper account.
     if self.settings then
         self.settings:saveSetting("pending_progress", {})
@@ -1221,39 +1628,17 @@ function Instapaper:fetchAndShowArticles(folder_id, folder_name)
     UIManager:show(info)
     UIManager:forceRePaint()
 
-    local params = { limit = tostring(self.article_limit or 50) }
-    if folder_id then
-        params.folder_id = folder_id
-    end
-
-    local ok, body, code = self:apiRequest("/api/1/bookmarks/list", params)
-
+    local ok, bookmarks = self:apiListBookmarks(folder_id, self.article_limit or 50)
     if not ok then
+        UIManager:close(info)
         UIManager:show(InfoMessage:new{
-            text = T(_("Failed to fetch articles: %1"), body or tostring(code)),
+            text = T(_("Failed to fetch articles: %1"), bookmarks),
         })
         return
-    end
-
-    local parse_ok, data = pcall(JSON.decode, body)
-    if not parse_ok or type(data) ~= "table" then
-        UIManager:show(InfoMessage:new{
-            text = _("Failed to parse article list."),
-        })
-        return
-    end
-
-    -- /api/1/bookmarks/list returns array of objects, first is user info
-    local bookmarks = {}
-    if type(data) == "table" then
-        for _, item in ipairs(data) do
-            if type(item) == "table" and item.type == "bookmark" then
-                table.insert(bookmarks, item)
-            end
-        end
     end
 
     if #bookmarks == 0 then
+        UIManager:close(info)
         UIManager:show(InfoMessage:new{
             text = _("No articles found."),
         })
@@ -1532,14 +1917,24 @@ function Instapaper:writeBookMetadata(filepath, bookmark, html)
 end
 
 function Instapaper:fetchArticleHtml(bookmark)
-    local ok, html, code = self:apiRequest("/api/1/bookmarks/get_text", {
-        bookmark_id = tostring(bookmark.bookmark_id),
-    }, true)
-    if not ok then
-        return nil, code
+    local html, err = self:apiGetArticleHtml(bookmark)
+    if not html then
+        return nil, err
     end
     html = self:injectTitleIfMissing(html, bookmark)
     return html, nil
+end
+
+-- Settings → After download: archive, or archive and mark as read.
+function Instapaper:runAfterDownloadAction(bookmark)
+    local action = self.after_download_action
+    if action ~= "archive" and action ~= "read" then
+        return
+    end
+    self:apiBookmarkAction("archive", bookmark.bookmark_id)
+    if action == "read" then
+        self:apiSetProgress(bookmark.bookmark_id, 1.0, os.time())
+    end
 end
 
 function Instapaper:saveArticleHtml(bookmark, html)
@@ -1602,7 +1997,7 @@ function Instapaper:downloadArticleOnly(bookmark)
     if not html then
         UIManager:close(info)
         UIManager:show(InfoMessage:new{
-            text = T(_("Download failed (HTTP %1)"), tostring(err)),
+            text = T(_("Download failed: %1"), tostring(err)),
         })
         return
     end
@@ -1622,20 +2017,7 @@ function Instapaper:downloadArticleOnly(bookmark)
         timeout = 2,
     })
 
-    if self.after_download_action == "archive" then
-        self:apiRequest("/api/1/bookmarks/archive", {
-            bookmark_id = tostring(bookmark.bookmark_id),
-        })
-    elseif self.after_download_action == "read" then
-        self:apiRequest("/api/1/bookmarks/archive", {
-            bookmark_id = tostring(bookmark.bookmark_id),
-        })
-        self:apiRequest("/api/1/bookmarks/update_read_progress", {
-            bookmark_id = tostring(bookmark.bookmark_id),
-            progress = "1.0",
-            progress_timestamp = tostring(os.time()),
-        })
-    end
+    self:runAfterDownloadAction(bookmark)
 end
 
 function Instapaper:downloadAndOpenArticle(bookmark)
@@ -1649,7 +2031,7 @@ function Instapaper:downloadAndOpenArticle(bookmark)
     if not html then
         UIManager:close(info)
         UIManager:show(InfoMessage:new{
-            text = T(_("Download failed (HTTP %1)"), tostring(err)),
+            text = T(_("Download failed: %1"), tostring(err)),
         })
         return
     end
@@ -1663,20 +2045,7 @@ function Instapaper:downloadAndOpenArticle(bookmark)
         return
     end
 
-    if self.after_download_action == "archive" then
-        self:apiRequest("/api/1/bookmarks/archive", {
-            bookmark_id = tostring(bookmark.bookmark_id),
-        })
-    elseif self.after_download_action == "read" then
-        self:apiRequest("/api/1/bookmarks/archive", {
-            bookmark_id = tostring(bookmark.bookmark_id),
-        })
-        self:apiRequest("/api/1/bookmarks/update_read_progress", {
-            bookmark_id = tostring(bookmark.bookmark_id),
-            progress = "1.0",
-            progress_timestamp = tostring(os.time()),
-        })
-    end
+    self:runAfterDownloadAction(bookmark)
 
     -- Open in KOReader
     local ReaderUI = require("apps/reader/readerui")
@@ -1818,23 +2187,9 @@ end
 
 -- Returns a list of {text, value} for user-created folders, or nil on error.
 function Instapaper:fetchUserFolders()
-    local ok, body, code = self:apiRequest("/api/1/folders/list", {})
-    if not ok then
-        logger.warn("Instapaper: failed to fetch folders", code)
-        return nil
-    end
-    local parse_ok, data = pcall(JSON.decode, body)
-    if not parse_ok or type(data) ~= "table" then
-        return nil
-    end
-    local folders = {}
-    for _, item in ipairs(data) do
-        if type(item) == "table" and item.type == "folder" then
-            table.insert(folders, {
-                text  = item.title or item.slug or tostring(item.folder_id),
-                value = tostring(item.folder_id),
-            })
-        end
+    local folders, err = self:apiListFolders()
+    if not folders then
+        logger.warn("Instapaper: failed to fetch folders", err)
     end
     return folders
 end
@@ -2034,43 +2389,35 @@ function Instapaper:runBulkDownload(folder_id, days_limit, archive_after, delete
     Trapper:wrap(function()
         Trapper:info(_("Fetching article list..."))
 
-        local params = { limit = "500" }  -- bulk always fetches max
-        if folder_id then
-            params.folder_id = folder_id
-        end
-
-        local ok, body, code = self:apiRequest("/api/1/bookmarks/list", params)
-        if not ok then
-            Trapper:clear()
-            UIManager:show(InfoMessage:new{
-                text = T(_("Failed to fetch articles: %1"), body or tostring(code)),
-            })
-            return
-        end
-
-        local parse_ok, data = pcall(JSON.decode, body)
-        if not parse_ok or type(data) ~= "table" then
-            Trapper:clear()
-            UIManager:show(InfoMessage:new{
-                text = _("Failed to parse article list."),
-            })
-            return
-        end
-
+        -- v1 caps a list at 500 articles. v2 has no cap, so page through the
+        -- whole list, 500 at a time.
+        local page_size = 500
+        local cutoff = (days_limit and days_limit > 0)
+            and (os.time() - days_limit * 86400) or nil
         local bookmarks = {}
-        for _, item in ipairs(data) do
-            if type(item) == "table" and item.type == "bookmark" then
+        local offset = 0
+        while true do
+            local ok, page, page_count = self:apiListBookmarks(folder_id, page_size, offset)
+            if not ok then
+                Trapper:clear()
+                UIManager:show(InfoMessage:new{
+                    text = T(_("Failed to fetch articles: %1"), page),
+                })
+                return
+            end
+            for _, item in ipairs(page) do
                 -- Apply days filter (client-side)
-                local include = true
-                if days_limit and days_limit > 0 then
-                    local cutoff = os.time() - (days_limit * 86400)
-                    if not item.time or item.time < cutoff then
-                        include = false
-                    end
-                end
-                if include then
+                if not cutoff or (item.time and item.time >= cutoff) then
                     table.insert(bookmarks, item)
                 end
+            end
+            if not self:usesV2() or page_count < page_size then
+                break
+            end
+            offset = offset + page_count
+            if not Trapper:info(T(_("Fetching article list... (%1)"), tostring(offset))) then
+                Trapper:clear()
+                return
             end
         end
 
@@ -2118,13 +2465,9 @@ function Instapaper:runBulkDownload(folder_id, days_limit, archive_after, delete
                     downloaded = downloaded + 1
                     -- Archive or delete after successful download
                     if archive_after then
-                        self:apiRequest("/api/1/bookmarks/archive", {
-                            bookmark_id = tostring(bm.bookmark_id),
-                        })
+                        self:apiBookmarkAction("archive", bm.bookmark_id)
                     elseif delete_after then
-                        self:apiRequest("/api/1/bookmarks/delete", {
-                            bookmark_id = tostring(bm.bookmark_id),
-                        })
+                        self:apiBookmarkAction("delete", bm.bookmark_id)
                     end
                 else
                     failed = failed + 1
@@ -2157,11 +2500,9 @@ end
 --------------------------------------------------------------------
 
 function Instapaper:archiveBookmark(bookmark_id, parent_menu, folder_id)
-    local ok, body = self:apiRequest("/api/1/bookmarks/archive", {
-        bookmark_id = tostring(bookmark_id),
-    })
+    local ok, err = self:apiBookmarkAction("archive", bookmark_id)
     UIManager:show(InfoMessage:new{
-        text = ok and _("Archived.") or T(_("Failed: %1"), body or ""),
+        text = ok and _("Archived.") or T(_("Failed: %1"), err or ""),
         timeout = 2,
     })
     if ok and parent_menu then
@@ -2171,11 +2512,9 @@ function Instapaper:archiveBookmark(bookmark_id, parent_menu, folder_id)
 end
 
 function Instapaper:deleteBookmark(bookmark_id, parent_menu, folder_id)
-    local ok, body = self:apiRequest("/api/1/bookmarks/delete", {
-        bookmark_id = tostring(bookmark_id),
-    })
+    local ok, err = self:apiBookmarkAction("delete", bookmark_id)
     UIManager:show(InfoMessage:new{
-        text = ok and _("Deleted.") or T(_("Failed: %1"), body or ""),
+        text = ok and _("Deleted.") or T(_("Failed: %1"), err or ""),
         timeout = 2,
     })
     if ok and parent_menu then
@@ -2185,11 +2524,9 @@ function Instapaper:deleteBookmark(bookmark_id, parent_menu, folder_id)
 end
 
 function Instapaper:starBookmark(bookmark_id)
-    local ok, body = self:apiRequest("/api/1/bookmarks/star", {
-        bookmark_id = tostring(bookmark_id),
-    })
+    local ok, err = self:apiBookmarkAction("star", bookmark_id)
     UIManager:show(InfoMessage:new{
-        text = ok and _("Starred.") or T(_("Failed: %1"), body or ""),
+        text = ok and _("Starred.") or T(_("Failed: %1"), err or ""),
         timeout = 2,
     })
 end
@@ -2335,20 +2672,23 @@ function Instapaper:addBookmark(url, title, description)
     end
     
     local params = { url = url }
-    if title and title ~= "" then
+    -- The link popup passes the URL as the title. Leave it out instead, so
+    -- Instapaper looks the real title up (and, on v2, does not overwrite the
+    -- title of a bookmark the account already has).
+    if title and title ~= "" and title ~= url then
         params.title = title
     end
     if description and description ~= "" then
         params.description = description
     end
-    
-    local ok, body, code = self:apiRequest("/api/1/bookmarks/add", params)
-    
+
+    local ok, err = self:apiAddBookmark(params)
+
     if ok then
         logger.info("Instapaper: bookmark added", url)
         return true
     else
-        logger.warn("Instapaper: failed to add bookmark", url, code)
+        logger.warn("Instapaper: failed to add bookmark", url, err)
         return false
     end
 end

@@ -4,7 +4,8 @@ Download and read articles from your Instapaper account directly in KOReader.
 
 ## Features
 
-- **OAuth 1.0a authentication** using Instapaper's official Full API
+- **Instapaper API v2** (bearer token, JSON), with API v1 kept as a fallback
+- **Log in with a personal access token**, or with email and password (xAuth, until 30 September 2027)
 - Browse **Unread**, **Starred**, **Archived**, and **custom folders**
 - **Download and read** articles as HTML or EPUB in KOReader's built-in reader
 - **EPUB output** — articles can be saved as EPUB files with optional image inclusion
@@ -35,9 +36,18 @@ Download and read articles from your Instapaper account directly in KOReader.
 
 ## Setup
 
-### 1. Get OAuth Consumer Credentials
+There are two ways to log in. The **access token** is the recommended one: it
+needs no password and nothing else to configure.
 
-Before you can use this plugin, you need to create OAuth consumer credentials on Instapaper:
+| | Access token (recommended) | Email and password (xAuth) |
+|---|---|---|
+| Needs | an access token | consumer key + secret, then email + password |
+| API | v2 only | v2, or v1 as a fallback |
+| Lifetime | until you revoke it | Instapaper turns xAuth off for new logins on **30 September 2027** (existing logins keep working) |
+
+### 1. Create an Application on Instapaper
+
+Both ways start with an application of your own on Instapaper:
 
 1. Visit: <https://www.instapaper.com/developers/applications/create>
 2. Fill out the form with your application details. Example:
@@ -45,10 +55,16 @@ Before you can use this plugin, you need to create OAuth consumer credentials on
     2. Description: `Accessing Instapaper via KOReader`
     3. URL: `https://koreader.rocks/`
     4. Admin Email: `your@email.com`
-3. After you submit the **Consumer Key** and **Consumer Secret** are displayed. Copy these values.
+3. After you submit, the **Consumer Key** and **Consumer Secret** are displayed. Copy them if you want the email and password login.
 4. Leave the OAuth key as "Owner Only" (the default). You do not need to click "Submit for Review".
+   An owner-only application also means article text is fetched as *personal
+   use*, which needs no Instaparser key.
+5. For the access token login: on <https://www.instapaper.com/developers/applications>,
+   generate an **access token** for your application and copy it.
 
-### 2. Configure the Plugin
+### 2. Configure the Plugin (email and password login only)
+
+Skip this step if you log in with an access token.
 
 #### Option A: Via KOReader Menu (Recommended)
 
@@ -80,11 +96,20 @@ Alternatively, you can create a configuration file manually:
 ### 3. Log In
 
 1. In the Instapaper menu, select **Log in**
-2. Enter your Instapaper **email or username**
-3. Enter your **password** (leave blank if you don't have one)
-4. Tap **Login**
+2. Choose a method:
+   - **Access token** — paste the token and tap **Login**. The plugin checks it
+     against Instapaper and shows your username in the **Log out** entry.
+   - **Email and password** — enter your Instapaper **email or username** and
+     your **password** (leave blank if you don't have one), then tap **Login**
+3. Once logged in, the token is saved and you won't need to log in again unless you explicitly log out.
 
-Once logged in, your OAuth tokens are saved and you won't need to log in again unless you explicitly log out.
+### Upgrading from 1.5 or earlier
+
+Nothing to do. The token saved by the old email and password login is used as
+an API v2 bearer token, so you stay logged in. If Instapaper ever turns that
+token away on v2 before v2 has worked once for it, the plugin switches itself
+to API v1 and asks you to try again. You can also switch by hand under
+**Settings → API**.
 
 ## Usage
 
@@ -164,48 +189,65 @@ Select **Settings** from the Instapaper menu to configure:
 - **Auto connect network** — When adding links to Instapaper:
   - **ON** (default) — Automatically open network connection and send immediately
   - **OFF** — Add to pending queue without connecting; links are sent when network is opened elsewhere
+- **API** — **v2** (default) or **v1**. v1 is only available after an email and
+  password login; an access token works with v2 only. It is there as a way back
+  in case v2 misbehaves, and v1 lists stop at 500 articles.
 
 ## Implementation Details
 
-This plugin uses the **Instapaper Full API** (OAuth 1.0a):
+This plugin uses the **Instapaper API v2** (`https://www.instapaper.com/api/2`,
+JSON, OAuth 2 bearer token). API v1 (OAuth 1.0a) is kept behind the same
+functions as a fallback; `instapaper_v2.lua` maps v2 responses onto the
+bookmark shape the rest of the plugin has always used.
 
 ### Authentication
-- **xAuth login**: `/api/1/oauth/access_token` with username/password → OAuth tokens
-- **HMAC-SHA1 signing**: All API requests are signed using `openssl.hmac`
-- **Persistent storage**: OAuth tokens saved in `settings/instapaper.lua`
+- **Access token**: sent as `Authorization: Bearer <token>`, checked on login with `GET /me`
+- **xAuth login** (v1, until 30 September 2027): `/api/1/oauth/access_token` with username/password → OAuth token + token secret. The token also works as a v2 bearer token.
+- **HMAC-SHA1 signing**: v1 requests only
+- **Persistent storage**: tokens saved in `settings/instapaper.lua` (`oauth_token`; `oauth_token_secret` only for xAuth). `api_version` and `v2_confirmed` record which API is in use and whether v2 has worked for this login yet.
 
 ### API Endpoints
-- **`/api/1/bookmarks/list`** — Fetch articles (with folder filtering)
-- **`/api/1/bookmarks/get_text`** — Download article HTML
-- **`/api/1/bookmarks/add`** — Add a new bookmark (URL) to Instapaper
-- **`/api/1/bookmarks/archive`** — Archive an article
-- **`/api/1/bookmarks/update_read_progress`** — Update reading progress on an article
-- **`/api/1/bookmarks/delete`** — Delete an article
-- **`/api/1/bookmarks/star`** — Star an article
-- **`/api/1/folders/list`** — Fetch user-created folders
+
+| Action | v2 | v1 fallback |
+|---|---|---|
+| List articles | `GET /bookmarks?section=home\|liked\|archive\|folder&folder_id=&limit=&offset=` (paged, no cap) | `/api/1/bookmarks/list` (max 500) |
+| Article text | `GET /bookmarks/{id}/parse` (JSON: body HTML + metadata) | `/api/1/bookmarks/get_text` |
+| Add a link | `POST /bookmarks` | `/api/1/bookmarks/add` |
+| Archive | `POST /bookmarks/{id}/move` `{"section":"archive"}` | `/api/1/bookmarks/archive` |
+| Reading progress | `POST /bookmarks/{id}` `{"progress":{"percentage","timestamp"}}` | `/api/1/bookmarks/update_read_progress` |
+| Delete | `DELETE /bookmarks/{id}` | `/api/1/bookmarks/delete` |
+| Star | `POST /bookmarks/{id}/like` | `/api/1/bookmarks/star` |
+| Custom folders | `GET /folders` | `/api/1/folders/list` |
+| Username | `GET /me` | — |
+
+The v2 parse endpoint returns only the article body. The plugin wraps it into a
+full HTML document (`<title>`, the byline as `<meta name="author">`, `dir="rtl"`
+for right-to-left articles), so the HTML and EPUB builders work the same on
+both APIs.
 
 ### Book Metadata
 
-The Instapaper API returns only `bookmark_id`, `url`, `title`, `description`,
-`hash`, `time`, `progress`, `progress_timestamp`, `starred` and
-`private_source` per bookmark. There is **no author, no excerpt and no
-thumbnail field**, so everything below is derived from bytes the plugin has
-already downloaded — no article ever costs an extra HTTP request for metadata:
+API v2 returns the byline (`author`) with each bookmark and the parsed article;
+v1 returns no author at all. Neither gives a usable excerpt or cover, so the
+rest below is derived from bytes the plugin has already downloaded — no article
+ever costs an extra HTTP request for metadata:
 
-- **Authors** — the source site (from the URL host) is always written. If the
-  text-view HTML happens to carry a `<meta name="author">`, `article:author`,
-  `rel="author"` or `itemprop="author"`, that byline is written above it. Two
+- **Authors** — the source site (from the URL host) is always written. The
+  byline from API v2 is written above it; on v1 (or when v2 has none), a
+  `<meta name="author">`, `article:author`, `rel="author"` or
+  `itemprop="author"` in the article HTML is used instead. Two
   `dc:creator` entries: crengine joins them with a newline and KOReader's book
   information shows one per line. Guesses that look like a date, a URL or a
   sentence are dropped — no author is better than a wrong one.
-- **Description** — Instapaper's own `description` is user-supplied (the
-  bookmarklet's text selection, or a source tweet) and is empty for most
-  articles, so it falls back to a ~320-character excerpt built from the
+- **Description** — Instapaper's own `description` is used when it has one (on
+  v1 it is user-supplied and empty for most articles; v2 falls back to the
+  article's opening text). Otherwise a ~320-character excerpt is built from the
   article's first paragraphs, with headings and figure captions removed.
 - **Cover** — the lead image is picked from the images already downloaded for
   the body: the first one at least 300×200 with a sane aspect ratio, measured by
-  reading PNG/GIF/JPEG headers straight out of memory. Instapaper's own
-  thumbnail is not reachable through the API.
+  reading PNG/GIF/JPEG headers straight out of memory. API v2 does return a
+  thumbnail URL, but using it would cost an extra download per article, so it
+  is not used yet.
 
   With **Designed cover** on, that image is not used as the cover directly.
   Instead a 600×800 grayscale bitmap is painted — title (up to 4 lines), the
@@ -252,18 +294,32 @@ The plugin implements RFC 5849 OAuth 1.0a signature generation:
 
 ## API Documentation
 
-- Simple API: https://www.instapaper.com/api/simple
-- Full API: https://www.instapaper.com/api/full
+- API v2 announcement: https://blog.instapaper.com/2026/09/29/instapaper-api-v2/
+- API v2 docs: https://www.instapaper.com/developers/overview/introduction
+- API v2 OpenAPI spec: https://www.instapaper.com/api/2/openapi.json
+- Migrating from v1: https://www.instapaper.com/developers/overview/migrating-from-v1
+- Full API (v1): https://www.instapaper.com/api/full
 
 ## Troubleshooting
 
-### "Please set API credentials first"
-You need to obtain OAuth consumer credentials from Instapaper first. See **Setup** section above.
+### "Email and password login needs API credentials first"
+The email and password login needs your application's consumer key and secret.
+See **Setup** above, or log in with an access token instead.
 
 ### "Login failed"
-- Check your username/email and password
-- Verify your consumer key and secret are correct
+- Access token: check that you copied the whole token and that it has not been revoked (HTTP 401)
+- Email and password: check your username/email and password, and that the consumer key and secret are correct. After 30 September 2027 this login no longer works; use an access token
 - Ensure you have network connectivity
+
+### "API v2 did not accept this login, so the plugin switched back to API v1"
+Your saved email and password login was turned away by v2 before v2 had ever
+worked for it. Everything keeps working on v1. To try v2 again, pick
+**Settings → API → v2**, or log out and log in with an access token.
+
+### Download failed: HTTP 402 / HTTP 429
+Instapaper's article parser (Instaparser) is out of free credits (402) or rate
+limited (429). Wait a while and try again; for bulk downloads, download fewer
+articles at a time.
 
 ### Articles won't download
 - Check network connection
