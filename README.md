@@ -193,6 +193,13 @@ If you have links waiting in the queue:
   - **Archive + Delete file** — Archive it, then delete the downloaded file and its sidecar from the device
 
   Works offline: the article is archived (and deleted) the next time the device is online.
+- **Return to list from an article** — ways back to the list an article was opened from (articles opened from the file browser are not affected):
+  - **Button position** — Top left, Top right, Bottom left, Bottom right (default; above the status bar), or Off
+  - **Show button** — Show the small **Insta** button in that corner. When hidden, tapping the corner still returns to the list
+  - **Ask at end of article** — Replace the end-of-document dialog with one offering **Back to Instapaper list**, **Go to beginning** and **File browser**
+  - **Back key returns to the list** — On devices with keys, when there is nothing to go back to inside the article
+
+  Closing the list you returned to also closes the article and opens the file browser, so the two do not loop.
 - **Auto connect network** — When adding links to Instapaper:
   - **ON** (default) — Automatically open network connection and send immediately
   - **OFF** — Add to pending queue without connecting; links are sent when network is opened elsewhere

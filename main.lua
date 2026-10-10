@@ -25,6 +25,7 @@ local Event = require("ui/event")
 local base64_encode = require("mime").b64
 local sha2 = require("ffi/sha2")
 local V2 = require("instapaper_v2")
+local ReaderReturn = require("instapaper_reader_return")
 
 -- Per-run memory, shared by the file manager's and the reader's plugin
 -- instances (main.lua is loaded once per KOReader run):
@@ -524,6 +525,12 @@ function Instapaper:onReaderReady()
         self:restoreRemoteReadingProgress()
     end)
 
+    -- "Back to the list" button, corner tap, end-of-article dialog, Back key.
+    local ok, err = pcall(ReaderReturn.setup, self)
+    if not ok then
+        logger.warn("Instapaper: reader return setup failed", tostring(err))
+    end
+
     if NetworkMgr:isOnline() then
         UIManager:scheduleIn(2, function()
             if self:countPending() > 0 then
@@ -571,6 +578,13 @@ function Instapaper:onCloseDocument()
     -- position. Queue first, then send immediately only when already online.
     self:captureCurrentReadingProgress(true)
     self:queueFinishedCurrentDocument()
+
+    -- Reading an article opened from a list counts as using that list, so
+    -- "Continue" is still offered for an hour after a long read.
+    if session.last_list and self.ui and self.ui.document
+            and ReaderReturn.isArticle(self.ui.document.file) then
+        session.last_list.time = os.time()
+    end
 end
 
 function Instapaper:loadSettings()
@@ -1445,7 +1459,12 @@ function Instapaper:getSettingsMenuItems()
             { _("None"), "none" },
             { _("Archive"), "archive" },
             { _("Archive + Delete file"), "delete" },
-        }, true),
+        }),
+        {
+            text = _("Return to list from an article"),
+            sub_item_table_func = ReaderReturn.getSettingsMenuItems,
+            separator = true,
+        },
         {
             text = _("Auto connect network"),
             checked_func = function() return self.auto_connect_network end,
@@ -1868,11 +1887,11 @@ local function folderTitle(folder_id, folder_name)
     return title
 end
 
--- The last list shown, if it was used within LAST_LIST_TTL. It lives in
--- module memory, so a KOReader restart drops it.
-function Instapaper:getLastList()
+-- The last list shown, if it was used within LAST_LIST_TTL (or at all, with
+-- ignore_ttl). It lives in module memory, so a KOReader restart drops it.
+function Instapaper:getLastList(ignore_ttl)
     local last = session.last_list
-    if last and os.time() - last.time <= LAST_LIST_TTL then
+    if last and (ignore_ttl or os.time() - last.time <= LAST_LIST_TTL) then
         return last
     end
 end
@@ -1888,8 +1907,11 @@ function Instapaper:getLastListLabel()
 end
 
 -- Reopen the last list where it was left, without an API call.
-function Instapaper:continueLastList()
-    local last = self:getLastList()
+-- opts.ignore_ttl: also when older than an hour (back from an article).
+-- opts.on_leave: run when the user closes the list (see showArticleMenu).
+function Instapaper:continueLastList(opts)
+    opts = opts or {}
+    local last = self:getLastList(opts.ignore_ttl)
     if not last then
         return
     end
@@ -1927,10 +1949,38 @@ function Instapaper:continueLastList()
         return
     end
     self:showArticleMenu(bookmarks, last.folder_id, last.folder_name, paging,
-        math.min(last.itemnumber, #bookmarks))
+        math.min(last.itemnumber, #bookmarks), opts.on_leave)
 end
 
-function Instapaper:showArticleMenu(bookmarks, folder_id, folder_name, paging, itemnumber)
+-- From an article opened from a list (button, corner tap, end-of-article
+-- dialog, Back key): show that list on top of the reader. Returns true when
+-- a list was shown.
+function Instapaper:returnToListFromArticle()
+    if not self:getLastList(true) then
+        UIManager:show(InfoMessage:new{
+            text = _("No Instapaper list to go back to."),
+            timeout = 2,
+        })
+        return false
+    end
+    -- The article is still open underneath, so CloseDocument has not run:
+    -- record its progress and "When finished" now, for the list to show.
+    self:captureCurrentReadingProgress(false)
+    self:queueFinishedCurrentDocument()
+    self:continueLastList({
+        ignore_ttl = true,
+        -- Leaving the list must not drop back into the article: that would
+        -- loop. Close it too and land in the file browser.
+        on_leave = function()
+            ReaderReturn.closeArticle(self)
+        end,
+    })
+    return true
+end
+
+-- on_leave: run when the user closes the list (Back/close), not when an
+-- article is picked from it.
+function Instapaper:showArticleMenu(bookmarks, folder_id, folder_name, paging, itemnumber, on_leave)
     local menu_title = folderTitle(folder_id, folder_name)
 
     -- Saved for "Continue"; bookmarks and paging are shared with this menu,
@@ -2049,6 +2099,9 @@ function Instapaper:showArticleMenu(bookmarks, folder_id, folder_name, paging, i
         paging.last_page_count = page_count
         -- Keep the reader on the first new article.
         menu:switchItemTable(buildTitle(), buildItems(), first_new)
+        -- A whole-screen change through a partial refresh can leave half of
+        -- the old page on e-ink; flash it clean.
+        UIManager:setDirty(nil, "full")
         remember(firstItemOnPage())
     end
 
@@ -2101,6 +2154,7 @@ function Instapaper:showArticleMenu(bookmarks, folder_id, folder_name, paging, i
             keep = 1
         end
         menu:switchItemTable(buildTitle(), buildItems(), keep)
+        UIManager:setDirty(nil, "full")
         remember(firstItemOnPage())
 
         if not silent then
@@ -2127,6 +2181,9 @@ function Instapaper:showArticleMenu(bookmarks, folder_id, folder_name, paging, i
         close_callback = function()
             remember(firstItemOnPage())
             UIManager:close(menu)
+            if on_leave and not menu._picked then
+                on_leave()
+            end
         end,
         -- Menu closes itself after any item's callback; "Load more" has to
         -- keep the list open, so it is handled here instead.
@@ -2135,6 +2192,9 @@ function Instapaper:showArticleMenu(bookmarks, folder_id, folder_name, paging, i
                 NetworkMgr:runWhenOnline(loadMore)
                 return true
             end
+            -- An article was picked: close_callback is about to run, but
+            -- this is not leaving the list.
+            menu._picked = true
             return Menu.onMenuSelect(menu_self, item)
         end,
         onMenuHold = function(_, item)
@@ -2488,7 +2548,8 @@ function Instapaper:downloadAndOpenArticle(bookmark)
 
     self:runAfterDownloadAction(bookmark)
 
-    -- Open in KOReader
+    -- Open in KOReader; marked so the reader offers a way back to the list.
+    ReaderReturn.markArticle(filepath)
     local ReaderUI = require("apps/reader/readerui")
     ReaderUI:showReader(filepath)
 end

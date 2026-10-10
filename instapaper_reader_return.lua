@@ -1,0 +1,603 @@
+--[[--
+Reader-side "back to the Instapaper list" affordances.
+
+Vendored from rssreader.koplugin's rssreader_reader_return.lua and adapted:
+the list to go back to is the plugin's "Continue" list, and the settings
+are a native submenu.
+
+An article opened from an Instapaper list is a real ReaderUI document: from
+that point on the list is gone and the only way back is the main menu. This
+module adds cheaper ways back, all optional:
+
+  * a small floating button painted on every page (view module),
+  * a tap zone in the same corner (view modules never receive events, so the
+    tap has to be registered separately),
+  * an "end of article" dialog replacing the stock end-of-document one,
+  * the hardware Back key, when there is nothing left to go back to inside
+    the article itself.
+
+Everything here is best-effort. Any failure is logged and swallowed so the rest
+of the plugin keeps working, and every hook is instance-level (never a patch of
+a core module), so it dies together with the ReaderUI instance it was set up on.
+]]
+
+local Blitbuffer = require("ffi/blitbuffer")
+local ButtonDialog = require("ui/widget/buttondialog")
+local Device = require("device")
+local Font = require("ui/font")
+local FrameContainer = require("ui/widget/container/framecontainer")
+local Geom = require("ui/geometry")
+local HorizontalGroup = require("ui/widget/horizontalgroup")
+local HorizontalSpan = require("ui/widget/horizontalspan")
+local IconWidget = require("ui/widget/iconwidget")
+local Notification = require("ui/widget/notification")
+local Size = require("ui/size")
+local TextWidget = require("ui/widget/textwidget")
+local UIManager = require("ui/uimanager")
+local logger = require("logger")
+local _ = require("gettext")
+
+local Screen = Device.screen
+
+local ReaderReturn = {}
+
+-- Run fn(...) and never let it escape. Returns ok, result.
+local function try(what, fn, ...)
+    local ok, res = pcall(fn, ...)
+    if not ok then
+        logger.warn("Instapaper ReaderReturn:", what, "failed:", res)
+        return false
+    end
+    return true, res
+end
+
+--------------------------------------------------------------------
+-- Settings
+--------------------------------------------------------------------
+
+-- The button and its tap zone only mean something on a touchscreen: with keys
+-- only there is nothing to tap. Default them off there -- the Back key hook
+-- and the end-of-article dialog are what those devices get instead.
+local touch_default = Device:isTouchDevice() and true or false
+
+-- The corner takes "off" too, which turns off both the button and the tap
+-- zone; with the button hidden, the corner still answers to a tap.
+local BOOL_SETTINGS = {
+    button      = { key = "instapaper_reader_return_button",    default = true },
+    end_of_book = { key = "instapaper_reader_return_endofbook", default = true },
+    back_key    = { key = "instapaper_reader_return_backkey",   default = true },
+}
+
+local CORNER_SETTING = "instapaper_reader_return_corner"
+local HINT_SETTING = "instapaper_reader_return_hint_shown"
+-- Bottom right is the least contested corner: the top strip is the menu zone,
+-- the top right corner holds the dogear bookmark, and the Gestures plugin
+-- ships tap_right_bottom_corner with no action at all.
+local DEFAULT_CORNER = touch_default and "bottom_right" or "off"
+
+ReaderReturn.CORNERS = {
+    { id = "top_left",     text = _("Top left") },
+    { id = "top_right",    text = _("Top right") },
+    { id = "bottom_left",  text = _("Bottom left") },
+    { id = "bottom_right", text = _("Bottom right") },
+    { id = "off",          text = _("Off") },
+}
+
+function ReaderReturn.isOn(name)
+    local spec = BOOL_SETTINGS[name]
+    if not spec or not G_reader_settings then
+        return false
+    end
+    if spec.default then
+        return G_reader_settings:nilOrTrue(spec.key)
+    end
+    return G_reader_settings:isTrue(spec.key)
+end
+
+function ReaderReturn.toggle(name)
+    local spec = BOOL_SETTINGS[name]
+    if not spec or not G_reader_settings then
+        return
+    end
+    G_reader_settings:saveSetting(spec.key, not ReaderReturn.isOn(name))
+end
+
+function ReaderReturn.getCorner()
+    if not G_reader_settings then
+        return DEFAULT_CORNER
+    end
+    local value = G_reader_settings:readSetting(CORNER_SETTING, DEFAULT_CORNER)
+    for _, corner in ipairs(ReaderReturn.CORNERS) do
+        if corner.id == value then
+            return value
+        end
+    end
+    return DEFAULT_CORNER
+end
+
+function ReaderReturn.getCornerText()
+    local current = ReaderReturn.getCorner()
+    for _, corner in ipairs(ReaderReturn.CORNERS) do
+        if corner.id == current then
+            return corner.text
+        end
+    end
+    return current
+end
+
+function ReaderReturn.setCorner(id)
+    if G_reader_settings then
+        G_reader_settings:saveSetting(CORNER_SETTING, id)
+    end
+end
+
+--------------------------------------------------------------------
+-- Which document is "an Instapaper article opened from a list"?
+--------------------------------------------------------------------
+
+-- Only documents opened *from a list* count: the same file opened later from
+-- the file browser has no list to go back to. Module state survives the
+-- FileManager -> ReaderUI instance swap and dies with the process.
+local marked_article = nil
+
+local function normalizePath(path)
+    if type(path) ~= "string" or path == "" then
+        return nil
+    end
+    return (path:gsub("\\", "/"):gsub("//+", "/"))
+end
+
+function ReaderReturn.markArticle(path)
+    marked_article = normalizePath(path)
+end
+
+function ReaderReturn.forgetArticle()
+    marked_article = nil
+end
+
+function ReaderReturn.isArticle(path)
+    local normalized = normalizePath(path)
+    return marked_article ~= nil and normalized ~= nil and normalized == marked_article
+end
+
+--------------------------------------------------------------------
+-- The floating button (a view module: painted on every page, never
+-- receives events -- the tap zone below does that part)
+--------------------------------------------------------------------
+
+local ButtonOverlay = {}
+ButtonOverlay.__index = ButtonOverlay
+
+function ButtonOverlay.new()
+    local icon_size = Screen:scaleBySize(18)
+    local frame = FrameContainer:new{
+        background = Blitbuffer.COLOR_WHITE,
+        bordersize = Size.border.button,
+        radius = Size.radius.button,
+        padding = Size.padding.button,
+        margin = 0,
+        HorizontalGroup:new{
+            align = "center",
+            IconWidget:new{
+                icon = "chevron.left",
+                width = icon_size,
+                height = icon_size,
+                alpha = true,
+            },
+            HorizontalSpan:new{ width = Size.span.horizontal_small },
+            TextWidget:new{
+                text = "Insta",
+                face = Font:getFace("cfont", 14),
+            },
+        },
+    }
+    return setmetatable({ frame = frame }, ButtonOverlay)
+end
+
+-- ReaderView assigns .view to every view module it registers, so a bottom
+-- corner can sit above the status bar instead of on top of it.
+local function footerHeight(view)
+    if not view or not view.footer_visible or not view.footer then
+        return 0
+    end
+    local ok, height = pcall(view.footer.getHeight, view.footer)
+    if ok and type(height) == "number" then
+        return height
+    end
+    return 0
+end
+
+function ButtonOverlay:getGeom()
+    local size = self.frame:getSize()
+    local screen_w, screen_h = Screen:getWidth(), Screen:getHeight()
+    local gap = Size.padding.large
+    local corner = ReaderReturn.getCorner()
+    local x = gap
+    local y = gap
+    if corner == "top_right" or corner == "bottom_right" then
+        x = screen_w - size.w - gap
+    end
+    if corner == "bottom_left" or corner == "bottom_right" then
+        y = screen_h - size.h - gap - footerHeight(self.view)
+    end
+    return Geom:new{ x = x, y = y, w = size.w, h = size.h }
+end
+
+function ButtonOverlay:paintTo(bb, x, y)
+    local ok, geom = try("button paint", self.getGeom, self)
+    if not ok or not geom then
+        return
+    end
+    self.dimen = geom
+    -- The button relays itself out on every paint, its tap zone does not. Watch
+    -- for drift (rotation, the status bar being toggled) and let the owner
+    -- realign them.
+    local last = self.last_geom
+    if self.on_geom_change and (not last or last.x ~= geom.x or last.y ~= geom.y
+            or last.w ~= geom.w or last.h ~= geom.h) then
+        self.last_geom = geom
+        self.on_geom_change()
+    end
+    self.frame:paintTo(bb, x + geom.x, y + geom.y)
+end
+
+-- Called by ReaderView on rotation/resize; geometry is recomputed on every
+-- paint anyway, we only have to drop the cached one.
+function ButtonOverlay:resetLayout()
+    self.dimen = nil
+end
+
+--------------------------------------------------------------------
+-- Going back
+--------------------------------------------------------------------
+
+-- The list is a plain widget shown by UIManager, so it stacks on top of the
+-- reader; leaving it closes the article too (closeArticle), otherwise the two
+-- would loop. Opening another article from it goes through
+-- ReaderUI:showReader(), which tears this reader down for us.
+function ReaderReturn.returnToList(plugin)
+    if not plugin or type(plugin.returnToListFromArticle) ~= "function" then
+        return false
+    end
+    local ok, shown = try("reopening the Instapaper list", plugin.returnToListFromArticle, plugin)
+    return ok and shown and true or false
+end
+
+-- The flip side of returnToList: when the user leaves the list for good, the
+-- article underneath would otherwise pop back up, and its only way out is back
+-- into the list -- a loop. Close the article too and land in the file browser.
+-- Synchronous on purpose: UIManager repaints before running a nextTick task,
+-- so a deferred close would flash the article first. Safe here because we run
+-- inside the list's event handler, not inside ReaderUI's own.
+function ReaderReturn.closeArticle(plugin)
+    if not plugin or not plugin._ip_return_active then
+        return false
+    end
+    local ui = plugin.ui
+    if not ui or not ui.document or ui.tearing_down then
+        return false
+    end
+    local ReaderUI = require("apps/reader/readerui")
+    if ReaderUI.instance ~= ui then
+        return false
+    end
+    -- The article's own folder is the download folder; the home folder is
+    -- where the user actually wants to be.
+    local home_dir = G_reader_settings:readSetting("home_dir")
+    local closed = try("closing the article", function()
+        if home_dir then
+            ui.last_dir_for_file_browser = home_dir
+        end
+        ui:onClose()
+    end)
+    if closed then
+        try("showing the file browser", ui.showFileManager, ui)
+    end
+    -- Whatever failed above, something must be on screen before the next
+    -- repaint: UIManager quits KOReader once no window is left.
+    local FileManager = require("apps/filemanager/filemanager")
+    if not FileManager.instance and not UIManager:isWidgetShown(ui) then
+        try("showing the file browser directly", function()
+            FileManager:showFiles(home_dir)
+        end)
+    end
+    return closed
+end
+
+--------------------------------------------------------------------
+-- Hooks
+--------------------------------------------------------------------
+
+local function installButton(plugin)
+    if ReaderReturn.getCorner() == "off" or not ReaderReturn.isOn("button") then
+        return
+    end
+    local view = plugin.ui and plugin.ui.view
+    if not view or type(view.registerViewModule) ~= "function" then
+        return
+    end
+    local overlay = ButtonOverlay.new()
+    -- registerViewModule sets overlay.view, which getGeom needs to clear the
+    -- status bar in a bottom corner: register before measuring.
+    view:registerViewModule("instapaper_return", overlay)
+    plugin._ip_return_overlay = overlay
+    local geom = overlay:getGeom()
+    -- Seeded so the first paint does not count as drift.
+    overlay.last_geom = geom
+    overlay.on_geom_change = function()
+        UIManager:nextTick(function()
+            ReaderReturn.refreshTouchZone(plugin)
+        end)
+    end
+    -- The page underneath has already been painted by the time ReaderReady
+    -- fires, so ask for a repaint of just the button's area.
+    UIManager:setDirty(plugin.ui, "ui", geom)
+end
+
+local function installTouchZone(plugin)
+    if ReaderReturn.getCorner() == "off" then
+        return
+    end
+    local ui = plugin.ui
+    if not Device:isTouchDevice() or not ui or type(ui.registerTouchZones) ~= "function" then
+        return
+    end
+
+    local screen_w, screen_h = Screen:getWidth(), Screen:getHeight()
+    local zone
+    local overlay = plugin._ip_return_overlay
+    if overlay then
+        -- Hit area == the visible button plus a finger-sized margin.
+        local geom = overlay:getGeom()
+        local slack = Screen:scaleBySize(8)
+        zone = {
+            ratio_x = math.max(0, geom.x - slack) / screen_w,
+            ratio_y = math.max(0, geom.y - slack) / screen_h,
+            ratio_w = math.min(1, (geom.w + 2 * slack) / screen_w),
+            ratio_h = math.min(1, (geom.h + 2 * slack) / screen_h),
+        }
+    else
+        -- Button hidden: fall back to an invisible corner the size of
+        -- KOReader's own corner gesture zones (1/8).
+        local corner = ReaderReturn.getCorner()
+        zone = {
+            ratio_x = (corner == "top_right" or corner == "bottom_right") and 7/8 or 0,
+            ratio_y = (corner == "bottom_left" or corner == "bottom_right") and 7/8 or 0,
+            ratio_w = 1/8,
+            ratio_h = 1/8,
+        }
+    end
+
+    ui:registerTouchZones({
+        {
+            id = "instapaper_return_tap",
+            ges = "tap",
+            screen_zone = zone,
+            -- Anything that would otherwise swallow a tap in a corner. Listing
+            -- a zone that does not exist is harmless. tap_link is left out so
+            -- links keep winning.
+            overrides = {
+                "readerhighlight_tap",
+                "readermenu_ext_tap",
+                "readermenu_tap",
+                "readerfooter_tap",
+                "readerconfigmenu_ext_tap",
+                "readerconfigmenu_tap",
+                "tap_top_left_corner",
+                "tap_top_right_corner",
+                "tap_left_bottom_corner",
+                "tap_right_bottom_corner",
+                "tap_forward",
+                "tap_backward",
+            },
+            handler = function()
+                return ReaderReturn.returnToList(plugin)
+            end,
+        },
+    })
+end
+
+-- Re-register after a rotation: registerTouchZones() replaces a zone with the
+-- same id, and the stored ratios need recomputing. Must run after
+-- ReaderUI:onScreenResize(), hence the nextTick in the caller.
+function ReaderReturn.refreshTouchZone(plugin)
+    if not plugin or not plugin._ip_return_active then
+        return
+    end
+    try("refreshing the tap zone", installTouchZone, plugin)
+end
+
+function ReaderReturn.showEndOfArticleDialog(plugin)
+    local dialog
+    dialog = ButtonDialog:new{
+        name = "instapaper_end_of_article",
+        title = _("You've reached the end of the article.\nWhat would you like to do?"),
+        title_align = "center",
+        buttons = {
+            {{
+                text = _("Back to Instapaper list"),
+                callback = function()
+                    UIManager:close(dialog)
+                    ReaderReturn.returnToList(plugin)
+                end,
+            }},
+            {
+                {
+                    text = _("Go to beginning"),
+                    callback = function()
+                        UIManager:close(dialog)
+                        if plugin.ui and plugin.ui.gotopage then
+                            plugin.ui.gotopage:onGoToBeginning()
+                        end
+                    end,
+                },
+                {
+                    text = _("File browser"),
+                    callback = function()
+                        UIManager:close(dialog)
+                        local ui = plugin.ui
+                        local file = ui and ui.document and ui.document.file
+                        -- Delayed, like ReaderStatus does, so as not to tear
+                        -- down the instance we are running inside of.
+                        UIManager:nextTick(function()
+                            ui:onClose()
+                            ui:showFileManager(file)
+                        end)
+                    end,
+                },
+            },
+        },
+    }
+    UIManager:show(dialog)
+end
+
+local function installEndOfBook(plugin)
+    if not ReaderReturn.isOn("end_of_book") then
+        return
+    end
+    local status = plugin.ui and plugin.ui.status
+    -- ReaderStatus builds its end-of-document dialog inline with no extension
+    -- point, and it is registered before the plugins, so the event never
+    -- reaches us in time. Wrap the instance method instead.
+    if not status or type(status.onEndOfBook) ~= "function" or status._ip_return_wrapped then
+        return
+    end
+    local original = status.onEndOfBook
+    status._ip_return_wrapped = true
+    status.onEndOfBook = function(this, ...)
+        if plugin._ip_return_active and ReaderReturn.isOn("end_of_book") then
+            if try("end of article dialog", ReaderReturn.showEndOfArticleDialog, plugin) then
+                return true
+            end
+        end
+        return original(this, ...)
+    end
+end
+
+-- Is there somewhere to go back to *inside* the article (followed links,
+-- jumps)? If so the stock Back handling is still the useful one.
+local function hasInDocumentHistory(ui)
+    local link_stack = ui.link and ui.link.location_stack
+    if type(link_stack) == "table" and #link_stack > 0 then
+        return true
+    end
+    local back_stack = ui.back and ui.back.location_stack
+    if type(back_stack) == "table" and #back_stack > 0 then
+        return true
+    end
+    return false
+end
+
+local function installBackKey(plugin)
+    if not ReaderReturn.isOn("back_key") or not Device:hasKeys() then
+        return
+    end
+    local back = plugin.ui and plugin.ui.back
+    -- ReaderBack:onBack() always returns true and is registered before the
+    -- plugins, so wrapping the instance is the only way in.
+    if not back or type(back.onBack) ~= "function" or back._ip_return_wrapped then
+        return
+    end
+    local original = back.onBack
+    back._ip_return_wrapped = true
+    back.onBack = function(this, ...)
+        if plugin._ip_return_active and ReaderReturn.isOn("back_key")
+                and not hasInDocumentHistory(plugin.ui) then
+            if ReaderReturn.returnToList(plugin) then
+                return true
+            end
+        end
+        return original(this, ...)
+    end
+end
+
+local function showFirstRunHint()
+    if not G_reader_settings or G_reader_settings:isTrue(HINT_SETTING) then
+        return
+    end
+    local tappable = ReaderReturn.getCorner() ~= "off" and Device:isTouchDevice()
+    local text
+    if tappable and ReaderReturn.isOn("button") then
+        text = _("Tap the Insta button to go back to your Instapaper list.")
+    elseif tappable then
+        text = _("Tap the corner to go back to your Instapaper list.")
+    elseif ReaderReturn.isOn("back_key") and Device:hasKeys() then
+        text = _("Press Back to return to your Instapaper list.")
+    else
+        -- Nothing to point at; don't burn the one-time hint on a no-op.
+        return
+    end
+    G_reader_settings:saveSetting(HINT_SETTING, true)
+    UIManager:show(Notification:new{ text = text })
+end
+
+--------------------------------------------------------------------
+-- Entry point (called from Instapaper:onReaderReady)
+--------------------------------------------------------------------
+
+function ReaderReturn.setup(plugin)
+    local ui = plugin and plugin.ui
+    -- No document means we are the FileManager-side instance of the plugin.
+    if not ui or not ui.document then
+        return
+    end
+    if not ReaderReturn.isArticle(ui.document.file) then
+        return
+    end
+
+    plugin._ip_return_active = true
+
+    try("installing the button", installButton, plugin)
+    try("installing the tap zone", installTouchZone, plugin)
+    try("installing the end-of-article hook", installEndOfBook, plugin)
+    try("installing the Back key hook", installBackKey, plugin)
+    try("showing the first-run hint", showFirstRunHint)
+end
+
+--------------------------------------------------------------------
+-- Settings submenu (native, like the plugin's other settings). Changes apply
+-- to articles opened from now on.
+--------------------------------------------------------------------
+
+function ReaderReturn.getSettingsMenuItems()
+    local function toggleItem(name, text, opts)
+        local item = {
+            text = text,
+            checked_func = function() return ReaderReturn.isOn(name) end,
+            callback = function() ReaderReturn.toggle(name) end,
+        }
+        for k, v in pairs(opts or {}) do
+            item[k] = v
+        end
+        return item
+    end
+
+    local corner_items = {}
+    for _, corner in ipairs(ReaderReturn.CORNERS) do
+        corner_items[#corner_items + 1] = {
+            text = corner.text,
+            radio = true,
+            checked_func = function() return ReaderReturn.getCorner() == corner.id end,
+            callback = function() ReaderReturn.setCorner(corner.id) end,
+        }
+    end
+
+    return {
+        {
+            text_func = function()
+                return _("Button position: ") .. ReaderReturn.getCornerText()
+            end,
+            sub_item_table = corner_items,
+        },
+        toggleItem("button", _("Show button"), {
+            -- Hidden, the corner still answers to a tap.
+            enabled_func = function() return ReaderReturn.getCorner() ~= "off" end,
+            help_text = _("When the button is hidden, tapping the corner still returns to the list."),
+            separator = true,
+        }),
+        toggleItem("end_of_book", _("Ask at end of article")),
+        toggleItem("back_key", _("Back key returns to the list")),
+    }
+end
+
+return ReaderReturn
