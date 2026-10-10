@@ -17,6 +17,7 @@ local ltn12 = require("ltn12")
 local socketutil = require("socketutil")
 local util = require("util")
 local _ = require("gettext")
+local N_ = _.ngettext
 local T = FFIUtil.template
 local Dispatcher = require("dispatcher")
 local Event = require("ui/event")
@@ -24,6 +25,17 @@ local Event = require("ui/event")
 local base64_encode = require("mime").b64
 local sha2 = require("ffi/sha2")
 local V2 = require("instapaper_v2")
+
+-- Per-run memory, shared by the file manager's and the reader's plugin
+-- instances (main.lua is loaded once per KOReader run):
+--   last_list: the last article list shown, for "Continue"
+--   finished:  bookmark ids queued by "When finished" in this run
+--   progress:  reading progress made on this device, by bookmark id
+local session = {
+    last_list = nil,
+    finished = {},
+    progress = {},
+}
 
 --------------------------------------------------------------------
 -- OAuth 1.0a helpers
@@ -468,13 +480,27 @@ function Instapaper:onInstapaperUnread()
     return true
 end
 
+function Instapaper:onInstapaperContinueList()
+    if self:getLastList() then
+        self:continueLastList()
+    else
+        UIManager:show(InfoMessage:new{
+            text = _("No recent Instapaper list to continue."),
+            timeout = 2,
+        })
+    end
+    return true
+end
+
 function Instapaper:onDispatcherRegisterActions()
     Dispatcher:registerAction("instapaper_bulk_download",
         { category = "none", event = "InstapaperBulkDownload", title = _("Instapaper bulk download"), general = true, })
     Dispatcher:registerAction("instapaper_download_unread",
         { category = "none", event = "InstapaperDownloadUnread", title = _("Instapaper download unread"), general = true, })
     Dispatcher:registerAction("instapaper_unread",
-        { category = "none", event = "InstapaperUnread", title = _("Instapaper: unread"), general = true, separator = true, })
+        { category = "none", event = "InstapaperUnread", title = _("Instapaper: unread"), general = true, })
+    Dispatcher:registerAction("instapaper_continue_list",
+        { category = "none", event = "InstapaperContinueList", title = _("Instapaper: continue last list"), general = true, separator = true, })
 end
 
 --------------------------------------------------------------------
@@ -877,6 +903,7 @@ function Instapaper:captureCurrentReadingProgress(send_if_online)
     end
 
     local timestamp = os.time()
+    session.progress[bookmark_id] = progress
 
     -- Remember when this device last produced a reading position. This is used
     -- to decide whether a subsequently downloaded Instapaper position is newer.
@@ -1018,6 +1045,7 @@ function Instapaper:queueFinishedCurrentDocument()
         filepath = action == "delete" and self.ui.document.file or nil,
     }
     self:savePendingFinished(pending)
+    session.finished[bookmark_id] = true
 
     -- ReaderUI has already saved the sidecar before CloseDocument, so flush
     -- again to keep the flag. It stops re-archiving on every later close.
@@ -1136,111 +1164,130 @@ function Instapaper:addToMainMenu(menu_items)
     menu_items.instapaper = {
         text = _("Instapaper"),
         sorting_hint = "tools",
-        sub_item_table = {
-            {
-                text = _("Unread articles"),
-                callback = function()
-                    self:ensureOnlineAndLoggedIn(function()
-                        self:fetchAndShowArticles("unread")
-                    end)
-                end,
-            },
-            {
-                text = _("Starred articles"),
-                callback = function()
-                    self:ensureOnlineAndLoggedIn(function()
-                        self:fetchAndShowArticles("starred")
-                    end)
-                end,
-            },
-            {
-                text = _("Archived articles"),
-                callback = function()
-                    self:ensureOnlineAndLoggedIn(function()
-                        self:fetchAndShowArticles("archive")
-                    end)
-                end,
-                separator = true,
-            },
-            {
-                text = _("Custom folders"),
-                callback = function()
-                    self:ensureOnlineAndLoggedIn(function()
-                        self:fetchAndShowUserFolders()
-                    end)
-                end,
-            },
-            {
-                text = _("Bulk download..."),
-                callback = function()
-                    self:ensureOnlineAndLoggedIn(function()
-                        self:showBulkDownloadDialog()
-                    end)
-                end,
-            },
-            {
-                text = _("Open downloads folder"),
-                callback = function()
-                    self:openDownloadsFolder()
-                end,
-            },
-            {
-                text = _("Clear downloads cache"),
-                keep_menu_open = true,
-                callback = function()
-                    self:clearDownloadsCache()
-                end,
-            },
-            {
-                text_func = function()
-                    local count = #self:getPendingUrls()
-                    if count > 0 then
-                        return T(_("Process pending URLs (%1)"), tostring(count))
+        sub_item_table_func = function()
+            return self:getMainMenuItems()
+        end,
+    }
+end
+
+function Instapaper:getMainMenuItems()
+    local items = {
+        {
+            text = _("Unread articles"),
+            callback = function()
+                self:ensureOnlineAndLoggedIn(function()
+                    self:fetchAndShowArticles("unread")
+                end)
+            end,
+        },
+        {
+            text = _("Starred articles"),
+            callback = function()
+                self:ensureOnlineAndLoggedIn(function()
+                    self:fetchAndShowArticles("starred")
+                end)
+            end,
+        },
+        {
+            text = _("Archived articles"),
+            callback = function()
+                self:ensureOnlineAndLoggedIn(function()
+                    self:fetchAndShowArticles("archive")
+                end)
+            end,
+            separator = true,
+        },
+        {
+            text = _("Custom folders"),
+            callback = function()
+                self:ensureOnlineAndLoggedIn(function()
+                    self:fetchAndShowUserFolders()
+                end)
+            end,
+        },
+        {
+            text = _("Bulk download..."),
+            callback = function()
+                self:ensureOnlineAndLoggedIn(function()
+                    self:showBulkDownloadDialog()
+                end)
+            end,
+        },
+        {
+            text = _("Open downloads folder"),
+            callback = function()
+                self:openDownloadsFolder()
+            end,
+        },
+        {
+            text = _("Clear downloads cache"),
+            keep_menu_open = true,
+            callback = function()
+                self:clearDownloadsCache()
+            end,
+        },
+        {
+            text_func = function()
+                local count = #self:getPendingUrls()
+                if count > 0 then
+                    return T(_("Process pending URLs (%1)"), tostring(count))
+                else
+                    return _("Process pending URLs")
+                end
+            end,
+            callback = function()
+                self:processPendingPool()
+            end,
+            separator = true,
+        },
+        {
+            text = _("Settings"),
+            sub_item_table_func = function()
+                return self:getSettingsMenuItems()
+            end,
+        },
+        {
+            text = _("API credentials"),
+            keep_menu_open = true,
+            callback = function()
+                self:showCredentialsDialog()
+            end,
+        },
+        {
+            text_func = function()
+                if self:isLoggedIn() then
+                    if self.username and self.username ~= "" then
+                        return T(_("Log out (%1)"), self.username)
                     else
-                        return _("Process pending URLs")
+                        return _("Log out")
                     end
-                end,
-                callback = function()
-                    self:processPendingPool()
-                end,
-                separator = true,
-            },
-            {
-                text = _("Settings"),
-                sub_item_table_func = function()
-                    return self:getSettingsMenuItems()
-                end,
-            },
-            {
-                text = _("API credentials"),
-                keep_menu_open = true,
-                callback = function()
-                    self:showCredentialsDialog()
-                end,
-            },
-            {
-                text_func = function()
-                    if self:isLoggedIn() then
-                        if self.username and self.username ~= "" then
-                            return T(_("Log out (%1)"), self.username)
-                        else
-                            return _("Log out")
-                        end
-                    else
-                        return _("Log in")
-                    end
-                end,
-                keep_menu_open = true,
-                callback = function()
-                    if self:isLoggedIn() then
-                        self:logout()
-                    else
-                        self:showLoginMethodDialog()
-                    end
-                end,
-            },
+                else
+                    return _("Log in")
+                end
+            end,
+            keep_menu_open = true,
+            callback = function()
+                if self:isLoggedIn() then
+                    self:logout()
+                else
+                    self:showLoginMethodDialog()
+                end
+            end,
         },
     }
+
+    -- Back to the list left within the last hour, as it was.
+    local continue_label = self:getLastListLabel()
+    if continue_label then
+        table.insert(items, 1, {
+            text = continue_label,
+            callback = function()
+                self:continueLastList()
+            end,
+            separator = true,
+        })
+    end
+    return items
 end
 
 function Instapaper:ensureOnlineAndLoggedIn(callback)
@@ -1751,6 +1798,9 @@ function Instapaper:logout()
         self.settings:delSetting("bulk_folders")
         self.settings:delSetting("bulk_last_folder")
     end
+    session.last_list = nil
+    session.finished = {}
+    session.progress = {}
     self:saveSettings()
     UIManager:show(InfoMessage:new{
         text = _("Logged out."),
@@ -1765,6 +1815,10 @@ end
 -- v2 lists are paged: the first page is shown and "Load more" fetches the
 -- next one. v1 has no offset, so it gets one page of article_limit instead.
 local V2_LIST_PAGE_SIZE = 50
+-- A refresh reloads everything loaded so far in one request, up to this.
+local V2_LIST_MAX_PAGE_SIZE = 500
+-- "Continue" offers the last list for this long after it was last used.
+local LAST_LIST_TTL = 3600
 
 function Instapaper:fetchAndShowArticles(folder_id, folder_name)
     local info = InfoMessage:new{
@@ -1797,42 +1851,120 @@ function Instapaper:fetchAndShowArticles(folder_id, folder_name)
         offset = page_count,
         total = total,
         page_size = page_size,
+        last_page_count = page_count,
     })
 end
 
-function Instapaper:showArticleMenu(bookmarks, folder_id, folder_name, paging)
+local function folderTitle(folder_id, folder_name)
     local folder_names = {
         unread  = _("Unread"),
         starred = _("Starred"),
         archive = _("Archive"),
     }
+    local title = folder_name or folder_names[folder_id] or folder_id
+    if type(title) ~= "string" then
+        title = _("Articles")
+    end
+    return title
+end
 
-    local menu_title = folder_name or folder_names[folder_id] or folder_id or "Articles"
-    if type(menu_title) ~= "string" then
-        menu_title = "Articles"
+-- The last list shown, if it was used within LAST_LIST_TTL. It lives in
+-- module memory, so a KOReader restart drops it.
+function Instapaper:getLastList()
+    local last = session.last_list
+    if last and os.time() - last.time <= LAST_LIST_TTL then
+        return last
+    end
+end
+
+function Instapaper:getLastListLabel()
+    local last = self:getLastList()
+    if not last then
+        return nil
+    end
+    local page = math.ceil(last.itemnumber / last.perpage)
+    return T(_("Continue: %1 (page %2)"),
+        folderTitle(last.folder_id, last.folder_name), tostring(page))
+end
+
+-- Reopen the last list where it was left, without an API call.
+function Instapaper:continueLastList()
+    local last = self:getLastList()
+    if not last then
+        return
     end
 
-    local last_page_count = paging and paging.offset or #bookmarks
+    -- Leave out articles finished since (archived by "When finished") and
+    -- show the progress made on this device.
+    local bookmarks = {}
+    local removed = 0
+    for _, bm in ipairs(last.bookmarks) do
+        local id = tostring(bm.bookmark_id)
+        if session.finished[id] and last.folder_id ~= "archive" then
+            removed = removed + 1
+        else
+            if session.progress[id] then
+                bm.progress = session.progress[id]
+            end
+            bookmarks[#bookmarks + 1] = bm
+        end
+    end
+
+    -- Archived articles have left the server's list too: move the offset back
+    -- so "Load more" does not skip any. Duplicates are dropped on load.
+    local paging = last.paging
+    if removed > 0 then
+        paging.offset = math.max(0, paging.offset - removed)
+        if paging.total then
+            paging.total = math.max(0, paging.total - removed)
+        end
+    end
+
+    if #bookmarks == 0 then
+        self:ensureOnlineAndLoggedIn(function()
+            self:fetchAndShowArticles(last.folder_id, last.folder_name)
+        end)
+        return
+    end
+    self:showArticleMenu(bookmarks, last.folder_id, last.folder_name, paging,
+        math.min(last.itemnumber, #bookmarks))
+end
+
+function Instapaper:showArticleMenu(bookmarks, folder_id, folder_name, paging, itemnumber)
+    local menu_title = folderTitle(folder_id, folder_name)
+
+    -- Saved for "Continue"; bookmarks and paging are shared with this menu,
+    -- so "Load more" and refresh keep it up to date.
+    local state = {
+        folder_id = folder_id,
+        folder_name = folder_name,
+        bookmarks = bookmarks,
+        paging = paging,
+        itemnumber = itemnumber or 1,
+        perpage = 1,
+        time = os.time(),
+    }
+    session.last_list = state
+
     local function hasMore()
-        if not paging or not self:usesV2() then
+        if not self:usesV2() then
             return false
         end
         if paging.total then
             return paging.offset < paging.total
         end
-        return last_page_count >= paging.page_size
+        return paging.last_page_count >= paging.page_size
     end
 
     local function buildTitle()
         local title = "Instapaper - " .. menu_title
-        if paging and paging.total and paging.total > #bookmarks then
+        if paging.total and paging.total > #bookmarks then
             title = title .. " (" .. #bookmarks .. "/" .. paging.total .. ")"
         end
         return title
     end
 
     local menu
-    local loadMore
 
     local function buildItems()
         local menu_items = {}
@@ -1878,7 +2010,17 @@ function Instapaper:showArticleMenu(bookmarks, folder_id, folder_name, paging)
         return menu_items
     end
 
-    loadMore = function()
+    local function firstItemOnPage()
+        return math.max(1, ((menu.page or 1) - 1) * (menu.perpage or 1) + 1)
+    end
+
+    local function remember(n)
+        state.itemnumber = n
+        state.perpage = menu.perpage or 1
+        state.time = os.time()
+    end
+
+    local function loadMore()
         local info = InfoMessage:new{ text = _("Fetching articles...") }
         UIManager:show(info)
         UIManager:forceRePaint()
@@ -1892,15 +2034,83 @@ function Instapaper:showArticleMenu(bookmarks, folder_id, folder_name, paging)
             return
         end
 
+        local seen = {}
+        for _, bm in ipairs(bookmarks) do
+            seen[tostring(bm.bookmark_id)] = true
+        end
         local first_new = #bookmarks + 1
         for _, bm in ipairs(page) do
-            bookmarks[#bookmarks + 1] = bm
+            if not seen[tostring(bm.bookmark_id)] then
+                bookmarks[#bookmarks + 1] = bm
+            end
         end
         paging.offset = paging.offset + page_count
         paging.total = total or paging.total
-        last_page_count = page_count
+        paging.last_page_count = page_count
         -- Keep the reader on the first new article.
         menu:switchItemTable(buildTitle(), buildItems(), first_new)
+        remember(firstItemOnPage())
+    end
+
+    -- Reload what is loaded so far with the server's current data. New
+    -- articles arrive at the top, so jump there when there are any; otherwise
+    -- stay on the same page and say so. silent: the reload after Archive or
+    -- Delete, which only has to stay put.
+    local function refresh(silent)
+        local limit = paging.page_size
+        if self:usesV2() then
+            limit = math.min(math.max(paging.offset, paging.page_size),
+                V2_LIST_MAX_PAGE_SIZE)
+        end
+        local info = InfoMessage:new{ text = _("Fetching articles...") }
+        UIManager:show(info)
+        UIManager:forceRePaint()
+        local ok, page, page_count, total = self:apiListBookmarks(folder_id, limit)
+        UIManager:close(info)
+        if not ok then
+            UIManager:show(InfoMessage:new{
+                text = T(_("Failed to fetch articles: %1"), page),
+            })
+            return
+        end
+
+        local known = {}
+        for _, bm in ipairs(bookmarks) do
+            known[tostring(bm.bookmark_id)] = true
+        end
+        local new_count = 0
+        for _, bm in ipairs(page) do
+            if not known[tostring(bm.bookmark_id)] then
+                new_count = new_count + 1
+            end
+        end
+
+        -- Replace in place: state, buildItems and the closures share the table.
+        for i = #bookmarks, 1, -1 do
+            bookmarks[i] = nil
+        end
+        for i, bm in ipairs(page) do
+            bookmarks[i] = bm
+        end
+        paging.offset = page_count
+        paging.total = total
+        paging.last_page_count = page_count
+
+        local keep = math.min(firstItemOnPage(), math.max(#bookmarks, 1))
+        if not silent and new_count > 0 then
+            keep = 1
+        end
+        menu:switchItemTable(buildTitle(), buildItems(), keep)
+        remember(firstItemOnPage())
+
+        if not silent then
+            UIManager:show(InfoMessage:new{
+                text = new_count > 0
+                    and T(N_("1 new article", "%1 new articles", new_count), new_count)
+                    or _("No new articles."),
+                timeout = 2,
+            })
+        end
     end
 
     menu = Menu:new{
@@ -1909,7 +2119,13 @@ function Instapaper:showArticleMenu(bookmarks, folder_id, folder_name, paging)
         is_borderless = true,
         is_popout = false,
         title_bar_fm_style = true,
+        title_bar_left_icon = "cre.render.reload",
+        onLeftButtonTap = function()
+            NetworkMgr:runWhenOnline(function() refresh(false) end)
+            return true
+        end,
         close_callback = function()
+            remember(firstItemOnPage())
             UIManager:close(menu)
         end,
         -- Menu closes itself after any item's callback; "Load more" has to
@@ -1928,6 +2144,15 @@ function Instapaper:showArticleMenu(bookmarks, folder_id, folder_name, paging)
             return true
         end,
     }
+    -- Archive/Delete from the long-press dialog reload the list through this.
+    menu.refreshList = function()
+        NetworkMgr:runWhenOnline(function() refresh(true) end)
+    end
+
+    if itemnumber and itemnumber > 1 then
+        menu:switchItemTable(nil, menu.item_table, itemnumber)
+    end
+    remember(firstItemOnPage())
 
     UIManager:show(menu, "full")
 end
@@ -2786,8 +3011,12 @@ function Instapaper:archiveBookmark(bookmark_id, parent_menu, folder_id)
         timeout = 2,
     })
     if ok and parent_menu then
-        UIManager:close(parent_menu)
-        self:fetchAndShowArticles(folder_id)
+        if parent_menu.refreshList then
+            parent_menu.refreshList()
+        else
+            UIManager:close(parent_menu)
+            self:fetchAndShowArticles(folder_id)
+        end
     end
 end
 
@@ -2798,8 +3027,12 @@ function Instapaper:deleteBookmark(bookmark_id, parent_menu, folder_id)
         timeout = 2,
     })
     if ok and parent_menu then
-        UIManager:close(parent_menu)
-        self:fetchAndShowArticles(folder_id)
+        if parent_menu.refreshList then
+            parent_menu.refreshList()
+        else
+            UIManager:close(parent_menu)
+            self:fetchAndShowArticles(folder_id)
+        end
     end
 end
 
