@@ -19,7 +19,7 @@ Download and read articles from your Instapaper account directly in KOReader.
 - **Auto WiFi connect** — triggers network connection automatically when needed
 - **Title injection** — missing article titles are added as a top-level heading in the downloaded HTML
 - **Reading progress** display (percentage read)
-- **Configurable article list limit** — fetch up to 10, 25, 50, 100, 200, or 500 articles at once
+- **Paged article lists** — 50 articles at a time with **Load more…** at the end (API v2); API v1 fetches one page of 10–500
 - **Send to Instapaper** — Add web links to Instapaper directly from document link popups
 - **Offline queue** — Links are queued when offline and automatically sent when network becomes available
 - **Auto WiFi connect for links** — Configurable automatic network connection when adding links
@@ -143,8 +143,7 @@ Select **Bulk download...** from the menu to download multiple articles at once:
 
 - **Folder** — Choose which folder to download from (Unread, Starred, Archive, or any custom folder)
 - **Period** — Limit to articles saved within the last N days (0 = all)
-- **Archive after** — Automatically archive each article after downloading
-- **Delete after** — Automatically delete each article after downloading (mutually exclusive with Archive)
+- **After download** — None, **Archive**, or **Delete from Instapaper** for each downloaded article (the downloaded file is kept)
 
 ### Open Downloads Folder
 
@@ -176,13 +175,13 @@ If you have links waiting in the queue:
 
 ### Settings
 
-Select **Settings** from the Instapaper menu to configure:
+**Settings** in the Instapaper menu opens a submenu. Each row shows its current value, and changes are saved immediately:
 
-- **Article list limit** — Number of articles fetched per request: 10, 25, 50, 100, 200, or 500 (default: 50)
+- **Article list limit (API v1)** — Number of articles fetched per request: 10, 25, 50, 100, 200, or 500 (default: 50). Disabled with API v2, where lists load 50 at a time with **Load more…**
 - **Output format** — Save articles as **HTML** (default) or **EPUB**
 - **Include images (EPUB)** — When EPUB format is selected, optionally download and embed article images into the EPUB file (ON/OFF)
 - **Designed cover (EPUB)** — Draw a title/image/author cover instead of using the lead image as is (ON/OFF, default ON). With images off, the cover is still drawn, just without the picture
-- **After download** — Action to perform after downloading individual articles (tap or long-press → Download/Open):
+- **After single download** — Action to perform after downloading individual articles (tap or long-press → Download/Open; bulk download has its own setting):
   - **None** (default) — No action, article stays in its current folder
   - **Archive only** — Move article to Archive folder
   - **Archive + Mark read** — Move to Archive and mark as 100% read

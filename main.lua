@@ -283,7 +283,8 @@ end
 --------------------------------------------------------------------
 
 -- One page of a list. folder_id is the plugin's own list name: "unread",
--- "starred", "archive" or a folder id. Returns ok, bookmarks|error, page_count.
+-- "starred", "archive" or a folder id. Returns ok, bookmarks|error, page_count,
+-- total (v2 only, may be nil).
 -- v1 has no offset: it always returns the first page.
 function Instapaper:apiListBookmarks(folder_id, limit, offset)
     if self:usesV2() then
@@ -296,8 +297,8 @@ function Instapaper:apiListBookmarks(folder_id, limit, offset)
         if not ok then
             return false, httpError(code, err)
         end
-        local bookmarks, page_count = V2.parseBookmarkList(data)
-        return true, bookmarks, page_count
+        local bookmarks, page_count, total = V2.parseBookmarkList(data)
+        return true, bookmarks, page_count, total
     end
 
     local params = { limit = tostring(limit) }
@@ -1206,9 +1207,8 @@ function Instapaper:addToMainMenu(menu_items)
             },
             {
                 text = _("Settings"),
-                keep_menu_open = true,
-                callback = function()
-                    self:showSettingsDialog()
+                sub_item_table_func = function()
+                    return self:getSettingsMenuItems()
                 end,
             },
             {
@@ -1312,217 +1312,151 @@ function Instapaper:showCredentialsDialog()
     self.cred_dialog:onShowKeyboard()
 end
 
-function Instapaper:showSettingsDialog()
-    local limit_choices = { 10, 25, 50, 100, 200, 500 }
-    local current_limit = self.article_limit or 50
-
-    -- Find current index for limit
-    local limit_idx = 2  -- default to 25
-    for i, v in ipairs(limit_choices) do
-        if v == current_limit then
-            limit_idx = i
-            break
-        end
+-- Settings as a native submenu: each row shows its current value, choices
+-- open as radio lists, and every change is saved at once.
+function Instapaper:getSettingsMenuItems()
+    local function setValue(key, value)
+        self[key] = value
+        self:saveSettings()
     end
 
-    local output_format = self.output_format or "html"
-    local include_images = self.include_images or false
-    local designed_cover = self.designed_cover
-    if designed_cover == nil then designed_cover = true end
-    local after_download_action = self.after_download_action or "none"
-    local after_finish_action = self.after_finish_action or "none"
-    local cache_folder = self.cache_folder
-    local auto_connect = self.auto_connect_network
-    if auto_connect == nil then
-        auto_connect = true
+    -- A row labelled "Label: value" that opens its choices as a radio list.
+    -- choices: { { text, value }, ... }
+    local function choiceItem(label, key, default, choices, separator)
+        local sub = {}
+        for _, choice in ipairs(choices) do
+            sub[#sub + 1] = {
+                text = choice[1],
+                radio = true,
+                checked_func = function()
+                    return (self[key] or default) == choice[2]
+                end,
+                callback = function()
+                    setValue(key, choice[2])
+                end,
+            }
+        end
+        return {
+            text_func = function()
+                local current = self[key] or default
+                for _, choice in ipairs(choices) do
+                    if choice[2] == current then
+                        return label .. ": " .. choice[1]
+                    end
+                end
+                return label .. ": " .. tostring(current)
+            end,
+            sub_item_table = sub,
+            separator = separator,
+        }
     end
-    local api_version = self:usesV2() and "v2" or "v1"
 
-    local settings_dialog
-    local function rebuildSettingsDialog()
-        if settings_dialog then
-            UIManager:close(settings_dialog)
-        end
+    local function isEpub()
+        return self.output_format == "epub"
+    end
 
-        local default_dir = DataStorage:getDataDir() .. "/instapaper"
-        local fmt_label = output_format == "epub" and "EPUB" or "HTML"
-        local img_label = include_images and _("ON") or _("OFF")
-        local cover_label = designed_cover and _("ON") or _("OFF")
-        local limit_label = tostring(limit_choices[limit_idx])
-        local action_label
-        if after_download_action == "archive" then
-            action_label = _("Archive only")
-        elseif after_download_action == "read" then
-            action_label = _("Archive + Mark read")
-        else
-            action_label = _("None")
-        end
-        local finish_label
-        if after_finish_action == "archive" then
-            finish_label = _("Archive")
-        elseif after_finish_action == "delete" then
-            finish_label = _("Archive + Delete file")
-        else
-            finish_label = _("None")
-        end
-        
-        local cache_label
-        if cache_folder and cache_folder ~= "" then
-            if #cache_folder > 40 then
-                cache_label = "..." .. cache_folder:sub(-37)
-            else
-                cache_label = cache_folder
-            end
-        else
-            cache_label = _("Default")
-        end
+    local limit_choices = {}
+    for _, n in ipairs({ 10, 25, 50, 100, 200, 500 }) do
+        limit_choices[#limit_choices + 1] = { tostring(n), n }
+    end
 
-        local auto_label = auto_connect and _("ON") or _("OFF")
-        
-        settings_dialog = ButtonDialog:new{
-            title = _("Instapaper settings")
-                .. "\n" .. _("Article list limit: ") .. limit_label
-                .. "\n" .. _("Output format: ") .. fmt_label
-                .. "\n" .. _("Include images (EPUB): ") .. img_label
-                .. "\n" .. _("Designed cover (EPUB): ") .. cover_label
-                .. "\n" .. _("After download: ") .. action_label
-                .. "\n" .. _("When finished: ") .. finish_label
-                .. "\n" .. _("Auto connect network: ") .. auto_label
-                .. "\n" .. _("Cache folder: ") .. cache_label
-                .. "\n" .. _("API: ") .. api_version,
-            buttons = {
+    return {
+        -- v2 lists are paged with "Load more", so the limit is v1 only.
+        (function()
+            local item = choiceItem(_("Article list limit (API v1)"),
+                "article_limit", 50, limit_choices)
+            item.enabled_func = function() return not self:usesV2() end
+            return item
+        end)(),
+        choiceItem(_("Output format"), "output_format", "html", {
+            { "HTML", "html" },
+            { "EPUB", "epub" },
+        }),
+        {
+            text = _("Include images (EPUB)"),
+            enabled_func = isEpub,
+            checked_func = function() return self.include_images end,
+            callback = function()
+                setValue("include_images", not self.include_images)
+            end,
+        },
+        {
+            text = _("Designed cover (EPUB)"),
+            enabled_func = isEpub,
+            checked_func = function() return self.designed_cover end,
+            callback = function()
+                setValue("designed_cover", not self.designed_cover)
+            end,
+            separator = true,
+        },
+        choiceItem(_("After single download"), "after_download_action", "none", {
+            { _("None"), "none" },
+            { _("Archive only"), "archive" },
+            { _("Archive + Mark read"), "read" },
+        }),
+        choiceItem(_("When finished"), "after_finish_action", "none", {
+            { _("None"), "none" },
+            { _("Archive"), "archive" },
+            { _("Archive + Delete file"), "delete" },
+        }, true),
+        {
+            text = _("Auto connect network"),
+            checked_func = function() return self.auto_connect_network end,
+            callback = function()
+                setValue("auto_connect_network", not self.auto_connect_network)
+            end,
+        },
+        {
+            text_func = function()
+                local folder = self.cache_folder
+                if not folder or folder == "" then
+                    return _("Cache folder: ") .. _("Default")
+                end
+                if #folder > 30 then
+                    folder = "…" .. folder:sub(-29)
+                end
+                return _("Cache folder: ") .. folder
+            end,
+            keep_menu_open = true,
+            callback = function(touchmenu_instance)
+                self:showCacheFolderDialog(function(new_path)
+                    if new_path ~= self.cache_folder then
+                        setValue("cache_folder", new_path)
+                    end
+                    touchmenu_instance:updateItems()
+                end, self.cache_folder)
+            end,
+        },
+        {
+            text_func = function()
+                return _("API: ") .. (self:usesV2() and "v2" or "v1")
+            end,
+            sub_item_table = {
                 {
-                    {
-                        text = _("< Limit >"),
-                        callback = function()
-                            limit_idx = (limit_idx % #limit_choices) + 1
-                            rebuildSettingsDialog()
-                        end,
-                    },
-                    {
-                        text = _("< Format >"),
-                        callback = function()
-                            output_format = output_format == "html" and "epub" or "html"
-                            rebuildSettingsDialog()
-                        end,
-                    },
+                    text = "v2",
+                    radio = true,
+                    checked_func = function() return self:usesV2() end,
+                    callback = function()
+                        if not self:usesV2() then
+                            -- Choosing v2 by hand re-arms the fallback check.
+                            self.v2_confirmed = false
+                            setValue("api_version", "v2")
+                        end
+                    end,
                 },
                 {
-                    {
-                        text = _("Images: ") .. img_label,
-                        callback = function()
-                            include_images = not include_images
-                            rebuildSettingsDialog()
-                        end,
-                    },
-                    {
-                        text = _("< After download >"),
-                        callback = function()
-                            if after_download_action == "none" then
-                                after_download_action = "archive"
-                            elseif after_download_action == "archive" then
-                                after_download_action = "read"
-                            else
-                                after_download_action = "none"
-                            end
-                            rebuildSettingsDialog()
-                        end,
-                    },
-                },
-                {
-                    {
-                        text = _("Designed cover: ") .. cover_label,
-                        callback = function()
-                            designed_cover = not designed_cover
-                            rebuildSettingsDialog()
-                        end,
-                    },
-                    {
-                        text = _("< When finished >"),
-                        callback = function()
-                            if after_finish_action == "none" then
-                                after_finish_action = "archive"
-                            elseif after_finish_action == "archive" then
-                                after_finish_action = "delete"
-                            else
-                                after_finish_action = "none"
-                            end
-                            rebuildSettingsDialog()
-                        end,
-                    },
-                },
-                {
-                    {
-                        text = _("Auto connect: ") .. (auto_connect and _("ON") or _("OFF")),
-                        callback = function()
-                            auto_connect = not auto_connect
-                            rebuildSettingsDialog()
-                        end,
-                    },
-                    {
-                        text = _("< Cache folder >"),
-                        callback = function()
-                            UIManager:close(settings_dialog)
-                            self:showCacheFolderDialog(function(new_path)
-                                cache_folder = new_path
-                                rebuildSettingsDialog()
-                            end, cache_folder)
-                        end,
-                    },
-                },
-                {
-                    {
-                        text = _("API: ") .. api_version,
-                        callback = function()
-                            if api_version == "v2" and not self:hasV1Credentials() then
-                                UIManager:show(InfoMessage:new{
-                                    text = _("API v1 needs an email and password login. An access token works with API v2 only."),
-                                })
-                                return
-                            end
-                            api_version = api_version == "v2" and "v1" or "v2"
-                            rebuildSettingsDialog()
-                        end,
-                    },
-                },
-                {
-                    {
-                        text = _("Save"),
-                        callback = function()
-                            UIManager:close(settings_dialog)
-                            self.article_limit  = limit_choices[limit_idx]
-                            self.output_format  = output_format
-                            self.include_images = include_images
-                            self.designed_cover = designed_cover
-                            self.after_download_action = after_download_action
-                            self.after_finish_action = after_finish_action
-                            self.auto_connect_network = auto_connect
-                            self.cache_folder = cache_folder
-                            if api_version ~= (self:usesV2() and "v2" or "v1") then
-                                self.api_version = api_version
-                                -- Choosing v2 by hand re-arms the fallback check.
-                                self.v2_confirmed = false
-                            end
-                            self:saveSettings()
-                            UIManager:show(InfoMessage:new{
-                                text = _("Settings saved."),
-                                timeout = 2,
-                            })
-                        end,
-                    },
-                    {
-                        text = _("Cancel"),
-                        callback = function()
-                            UIManager:close(settings_dialog)
-                        end,
-                    },
+                    text = "v1",
+                    radio = true,
+                    enabled_func = function() return self:hasV1Credentials() end,
+                    checked_func = function() return not self:usesV2() end,
+                    callback = function()
+                        setValue("api_version", "v1")
+                    end,
+                    help_text = _("API v1 needs an email and password login. An access token works with API v2 only."),
                 },
             },
-        }
-        UIManager:show(settings_dialog)
-    end
-
-    rebuildSettingsDialog()
+        },
+    }
 end
 
 function Instapaper:showCacheFolderDialog(return_callback, current_folder)
@@ -1814,6 +1748,8 @@ function Instapaper:logout()
     if self.settings then
         self.settings:saveSetting("pending_progress", {})
         self.settings:saveSetting("pending_finished", {})
+        self.settings:delSetting("bulk_folders")
+        self.settings:delSetting("bulk_last_folder")
     end
     self:saveSettings()
     UIManager:show(InfoMessage:new{
@@ -1826,6 +1762,10 @@ end
 -- Bookmarks
 --------------------------------------------------------------------
 
+-- v2 lists are paged: the first page is shown and "Load more" fetches the
+-- next one. v1 has no offset, so it gets one page of article_limit instead.
+local V2_LIST_PAGE_SIZE = 50
+
 function Instapaper:fetchAndShowArticles(folder_id, folder_name)
     local info = InfoMessage:new{
         text = _("Fetching articles..."),
@@ -1833,7 +1773,8 @@ function Instapaper:fetchAndShowArticles(folder_id, folder_name)
     UIManager:show(info)
     UIManager:forceRePaint()
 
-    local ok, bookmarks = self:apiListBookmarks(folder_id, self.article_limit or 50)
+    local page_size = self:usesV2() and V2_LIST_PAGE_SIZE or (self.article_limit or 50)
+    local ok, bookmarks, page_count, total = self:apiListBookmarks(folder_id, page_size)
     if not ok then
         UIManager:close(info)
         UIManager:show(InfoMessage:new{
@@ -1852,63 +1793,133 @@ function Instapaper:fetchAndShowArticles(folder_id, folder_name)
 
     UIManager:close(info)
     UIManager:forceRePaint()
-    self:showArticleMenu(bookmarks, folder_id, folder_name)
+    self:showArticleMenu(bookmarks, folder_id, folder_name, {
+        offset = page_count,
+        total = total,
+        page_size = page_size,
+    })
 end
 
-function Instapaper:showArticleMenu(bookmarks, folder_id, folder_name)
+function Instapaper:showArticleMenu(bookmarks, folder_id, folder_name, paging)
     local folder_names = {
         unread  = _("Unread"),
         starred = _("Starred"),
         archive = _("Archive"),
     }
 
-    local menu
-    local menu_items = {}
-    for _, bm in ipairs(bookmarks) do
-        local title = bm.title
-        if not title or title == "" or type(title) ~= "string" then
-            title = "Untitled"
-        end
-
-        local progress_str = nil
-        if bm.progress and bm.progress > 0 then
-            progress_str = string.format("%d%%", bm.progress * 100)
-        end
-
-        local item = {
-            text = title,
-            _bookmark = bm,
-            callback = function()
-                NetworkMgr:runWhenOnline(function()
-                    self:downloadAndOpenArticle(bm)
-                end)
-            end,
-            hold_callback = function()
-                self:showArticleActions(bm, menu, folder_id)
-            end,
-            hold_keep_menu_open = true,
-        }
-
-        if progress_str then
-            item.mandatory = progress_str
-        end
-
-        table.insert(menu_items, item)
-    end
-
     local menu_title = folder_name or folder_names[folder_id] or folder_id or "Articles"
     if type(menu_title) ~= "string" then
         menu_title = "Articles"
     end
-    
+
+    local last_page_count = paging and paging.offset or #bookmarks
+    local function hasMore()
+        if not paging or not self:usesV2() then
+            return false
+        end
+        if paging.total then
+            return paging.offset < paging.total
+        end
+        return last_page_count >= paging.page_size
+    end
+
+    local function buildTitle()
+        local title = "Instapaper - " .. menu_title
+        if paging and paging.total and paging.total > #bookmarks then
+            title = title .. " (" .. #bookmarks .. "/" .. paging.total .. ")"
+        end
+        return title
+    end
+
+    local menu
+    local loadMore
+
+    local function buildItems()
+        local menu_items = {}
+        for _, bm in ipairs(bookmarks) do
+            local title = bm.title
+            if not title or title == "" or type(title) ~= "string" then
+                title = "Untitled"
+            end
+
+            local progress_str = nil
+            if bm.progress and bm.progress > 0 then
+                progress_str = string.format("%d%%", bm.progress * 100)
+            end
+
+            local item = {
+                text = title,
+                _bookmark = bm,
+                callback = function()
+                    NetworkMgr:runWhenOnline(function()
+                        self:downloadAndOpenArticle(bm)
+                    end)
+                end,
+                hold_callback = function()
+                    self:showArticleActions(bm, menu, folder_id)
+                end,
+                hold_keep_menu_open = true,
+            }
+
+            if progress_str then
+                item.mandatory = progress_str
+            end
+
+            table.insert(menu_items, item)
+        end
+
+        if hasMore() then
+            table.insert(menu_items, {
+                text = _("Load more…"),
+                bold = true,
+                _load_more = true,
+            })
+        end
+        return menu_items
+    end
+
+    loadMore = function()
+        local info = InfoMessage:new{ text = _("Fetching articles...") }
+        UIManager:show(info)
+        UIManager:forceRePaint()
+        local ok, page, page_count, total = self:apiListBookmarks(
+            folder_id, paging.page_size, paging.offset)
+        UIManager:close(info)
+        if not ok then
+            UIManager:show(InfoMessage:new{
+                text = T(_("Failed to fetch articles: %1"), page),
+            })
+            return
+        end
+
+        local first_new = #bookmarks + 1
+        for _, bm in ipairs(page) do
+            bookmarks[#bookmarks + 1] = bm
+        end
+        paging.offset = paging.offset + page_count
+        paging.total = total or paging.total
+        last_page_count = page_count
+        -- Keep the reader on the first new article.
+        menu:switchItemTable(buildTitle(), buildItems(), first_new)
+    end
+
     menu = Menu:new{
-        title = "Instapaper - " .. menu_title,
-        item_table = menu_items,
+        title = buildTitle(),
+        item_table = buildItems(),
         is_borderless = true,
         is_popout = false,
         title_bar_fm_style = true,
         close_callback = function()
             UIManager:close(menu)
+        end,
+        -- Menu closes itself after any item's callback; "Load more" has to
+        -- keep the list open, so it is handled here instead.
+        onMenuSelect = function(menu_self, item)
+            if item and item._load_more then
+                NetworkMgr:runWhenOnline(loadMore)
+                return true
+            end
+            return Menu.onMenuSelect(menu_self, item)
         end,
         onMenuHold = function(_, item)
             if item and type(item.hold_callback) == "function" then
@@ -2452,30 +2463,54 @@ end
 --------------------------------------------------------------------
 
 function Instapaper:showBulkDownloadDialog()
-    -- Start with built-in folders; custom folders appended after fetch
-    local folder_choices = {
+    local builtin_folders = {
         { text = _("Unread"),  value = "unread"  },
         { text = _("Starred"), value = "starred" },
         { text = _("Archive"), value = "archive" },
     }
 
-    -- Fetch user folders and append
-    local user_folders = self:fetchUserFolders()
-    if user_folders then
-        for _, f in ipairs(user_folders) do
-            table.insert(folder_choices, f)
+    -- The dialog opens without an API call: the last used folder is
+    -- remembered, and custom folders are fetched only when the Folder row is
+    -- tapped, so folders added in the meantime show up.
+    local selected_folder = self.settings:readSetting("bulk_last_folder")
+    if type(selected_folder) ~= "table" or not selected_folder.value then
+        selected_folder = builtin_folders[1]
+    end
+
+    local function fetchFolderChoices()
+        local info = InfoMessage:new{ text = _("Fetching folders...") }
+        UIManager:show(info)
+        UIManager:forceRePaint()
+        local user_folders = self:fetchUserFolders()
+        UIManager:close(info)
+        if user_folders then
+            self.settings:saveSetting("bulk_folders", user_folders)
+            self.settings:flush()
+        else
+            -- Offline or failed: fall back to the last list we got.
+            user_folders = self.settings:readSetting("bulk_folders") or {}
         end
+        local choices = {}
+        for _, f in ipairs(builtin_folders) do choices[#choices + 1] = f end
+        for _, f in ipairs(user_folders) do choices[#choices + 1] = f end
+        return choices
     end
 
-    -- State for the dialog
-    local selected_folder_idx = 1
+    -- State for the dialog. Archive and delete exclude each other, so they
+    -- are one choice here; the two stored flags stay as they were.
     local days_limit = 0   -- 0 = no limit
-    local archive_after = self.settings:readSetting("bulk_archive_after") or false
-    local delete_after  = self.settings:readSetting("bulk_delete_after")  or false
-
-    local function folderLabel()
-        return folder_choices[selected_folder_idx].text
+    local after_action = "none"
+    if self.settings:readSetting("bulk_archive_after") then
+        after_action = "archive"
+    elseif self.settings:readSetting("bulk_delete_after") then
+        after_action = "delete"
     end
+
+    local after_choices = {
+        { text = _("None"),                   value = "none"    },
+        { text = _("Archive"),                value = "archive" },
+        { text = _("Delete from Instapaper"), value = "delete"  },
+    }
 
     local function daysLabel()
         if days_limit == 0 then
@@ -2485,28 +2520,68 @@ function Instapaper:showBulkDownloadDialog()
         end
     end
 
+    local function afterLabel()
+        for _, c in ipairs(after_choices) do
+            if c.value == after_action then
+                return c.text
+            end
+        end
+    end
+
     local bulk_dialog
-    local function rebuildDialog()
+    local rebuildDialog
+
+    -- One choice per row; picking one returns to the bulk dialog.
+    local function showPicker(title, choices, current, on_pick)
+        UIManager:close(bulk_dialog)
+        local picker
+        local buttons = {}
+        for i, c in ipairs(choices) do
+            buttons[#buttons + 1] = { {
+                text = (i == current and "✓ " or "") .. c.text,
+                callback = function()
+                    UIManager:close(picker)
+                    on_pick(i)
+                    rebuildDialog()
+                end,
+            } }
+        end
+        buttons[#buttons + 1] = { {
+            text = _("Back"),
+            callback = function()
+                UIManager:close(picker)
+                rebuildDialog()
+            end,
+        } }
+        picker = ButtonDialog:new{ title = title, buttons = buttons }
+        UIManager:show(picker)
+    end
+
+    rebuildDialog = function()
         if bulk_dialog then
             UIManager:close(bulk_dialog)
         end
         bulk_dialog = ButtonDialog:new{
-            title = _("Bulk download settings")
-                .. "\n" .. _("Folder: ") .. folderLabel()
-                .. "\n" .. _("Period: ") .. daysLabel()
-                .. "\n" .. _("Archive after download: ") .. (archive_after and _("Yes") or _("No"))
-                .. "\n" .. _("Delete after download: ")  .. (delete_after  and _("Yes") or _("No")),
+            title = _("Bulk download"),
             buttons = {
                 {
                     {
-                        text = _("< Folder >"),
+                        text = _("Folder: ") .. selected_folder.text,
                         callback = function()
-                            selected_folder_idx = (selected_folder_idx % #folder_choices) + 1
-                            rebuildDialog()
+                            UIManager:close(bulk_dialog)
+                            local folder_choices = fetchFolderChoices()
+                            local current
+                            for i, c in ipairs(folder_choices) do
+                                if c.value == selected_folder.value then current = i end
+                            end
+                            showPicker(_("Folder"), folder_choices, current,
+                                function(i) selected_folder = folder_choices[i] end)
                         end,
                     },
+                },
+                {
                     {
-                        text = _("< Period >"),
+                        text = _("Period: ") .. daysLabel(),
                         callback = function()
                             UIManager:close(bulk_dialog)
                             local spin = SpinWidget:new{
@@ -2530,39 +2605,39 @@ function Instapaper:showBulkDownloadDialog()
                 },
                 {
                     {
-                        text = _("Archive after: ") .. (archive_after and _("ON") or _("OFF")),
+                        text = _("After download: ") .. afterLabel(),
                         callback = function()
-                            archive_after = not archive_after
-                            if archive_after then delete_after = false end
-                            rebuildDialog()
-                        end,
-                    },
-                    {
-                        text = _("Delete after: ") .. (delete_after and _("ON") or _("OFF")),
-                        callback = function()
-                            delete_after = not delete_after
-                            if delete_after then archive_after = false end
-                            rebuildDialog()
+                            local current
+                            for i, c in ipairs(after_choices) do
+                                if c.value == after_action then current = i end
+                            end
+                            showPicker(_("After download"), after_choices, current,
+                                function(i) after_action = after_choices[i].value end)
                         end,
                     },
                 },
                 {
                     {
-                        text = _("Start download"),
-                        callback = function()
-                            UIManager:close(bulk_dialog)
-                            -- Save preferences
-                            self.settings:saveSetting("bulk_archive_after", archive_after)
-                            self.settings:saveSetting("bulk_delete_after",  delete_after)
-                            self.settings:flush()
-                            local folder_val = folder_choices[selected_folder_idx].value
-                            self:runBulkDownload(folder_val, days_limit, archive_after, delete_after)
-                        end,
-                    },
-                    {
                         text = _("Cancel"),
                         callback = function()
                             UIManager:close(bulk_dialog)
+                        end,
+                    },
+                    {
+                        text = _("Start download"),
+                        callback = function()
+                            UIManager:close(bulk_dialog)
+                            local archive_after = after_action == "archive"
+                            local delete_after  = after_action == "delete"
+                            -- Save preferences
+                            self.settings:saveSetting("bulk_archive_after", archive_after)
+                            self.settings:saveSetting("bulk_delete_after",  delete_after)
+                            self.settings:saveSetting("bulk_last_folder", {
+                                text = selected_folder.text,
+                                value = selected_folder.value,
+                            })
+                            self.settings:flush()
+                            self:runBulkDownload(selected_folder.value, days_limit, archive_after, delete_after)
                         end,
                     },
                 },
