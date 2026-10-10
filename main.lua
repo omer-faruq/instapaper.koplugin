@@ -38,6 +38,20 @@ local session = {
     progress = {},
 }
 
+-- Display name of a list: built-in names, else the folder name we were given.
+local function folderTitle(folder_id, folder_name)
+    local folder_names = {
+        unread  = _("Unread"),
+        starred = _("Starred"),
+        archive = _("Archive"),
+    }
+    local title = folder_name or folder_names[folder_id] or folder_id
+    if type(title) ~= "string" then
+        title = _("Articles")
+    end
+    return title
+end
+
 --------------------------------------------------------------------
 -- OAuth 1.0a helpers
 --------------------------------------------------------------------
@@ -484,12 +498,24 @@ end
 function Instapaper:onInstapaperContinueList()
     if self:getLastList() then
         self:continueLastList()
-    else
-        UIManager:show(InfoMessage:new{
-            text = _("No recent Instapaper list to continue."),
-            timeout = 2,
-        })
+        return true
     end
+
+    -- Nothing recent to restore: open the last used folder (or Unread) fresh
+    -- from the server, and say so, since it is not the saved list.
+    local folder_id, folder_name = "unread", nil
+    local expired = self:getLastList(true)
+    local saved = self.settings:readSetting("last_list_folder")
+    if expired then
+        folder_id, folder_name = expired.folder_id, expired.folder_name
+    elseif type(saved) == "table" and saved.value then
+        folder_id, folder_name = saved.value, saved.text
+    end
+    self:ensureOnlineAndLoggedIn(function()
+        self:fetchAndShowArticles(folder_id, folder_name,
+            T(_("No recent list to continue.\nOpening %1…"),
+                folderTitle(folder_id, folder_name)))
+    end)
     return true
 end
 
@@ -1816,6 +1842,7 @@ function Instapaper:logout()
         self.settings:saveSetting("pending_finished", {})
         self.settings:delSetting("bulk_folders")
         self.settings:delSetting("bulk_last_folder")
+        self.settings:delSetting("last_list_folder")
     end
     session.last_list = nil
     session.finished = {}
@@ -1839,9 +1866,10 @@ local V2_LIST_MAX_PAGE_SIZE = 500
 -- "Continue" offers the last list for this long after it was last used.
 local LAST_LIST_TTL = 3600
 
-function Instapaper:fetchAndShowArticles(folder_id, folder_name)
+-- loading_text: shown instead of "Fetching articles..." while loading.
+function Instapaper:fetchAndShowArticles(folder_id, folder_name, loading_text)
     local info = InfoMessage:new{
-        text = _("Fetching articles..."),
+        text = loading_text or _("Fetching articles..."),
     }
     UIManager:show(info)
     UIManager:forceRePaint()
@@ -1872,19 +1900,6 @@ function Instapaper:fetchAndShowArticles(folder_id, folder_name)
         page_size = page_size,
         last_page_count = page_count,
     })
-end
-
-local function folderTitle(folder_id, folder_name)
-    local folder_names = {
-        unread  = _("Unread"),
-        starred = _("Starred"),
-        archive = _("Archive"),
-    }
-    local title = folder_name or folder_names[folder_id] or folder_id
-    if type(title) ~= "string" then
-        title = _("Articles")
-    end
-    return title
 end
 
 -- The last list shown, if it was used within LAST_LIST_TTL (or at all, with
@@ -1995,6 +2010,15 @@ function Instapaper:showArticleMenu(bookmarks, folder_id, folder_name, paging, i
         time = os.time(),
     }
     session.last_list = state
+
+    local saved = self.settings:readSetting("last_list_folder")
+    if type(saved) ~= "table" or saved.value ~= folder_id then
+        self.settings:saveSetting("last_list_folder", {
+            value = folder_id,
+            text = folder_name,
+        })
+        self.settings:flush()
+    end
 
     local function hasMore()
         if not self:usesV2() then

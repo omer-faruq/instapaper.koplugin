@@ -21,7 +21,7 @@ Download and read articles from your Instapaper account directly in KOReader.
 - **Reading progress** display (percentage read)
 - **Paged article lists** — 50 articles at a time with **Load more…** at the end (API v2); API v1 fetches one page of 10–500
 - **Refresh** — the reload icon at the top left of a list reloads it with the latest data, staying on the same page
-- **Continue** — for an hour after you last used a list (until KOReader restarts), **Continue: <folder> (page N)** at the top of the Instapaper menu reopens it where you left off, without a network request. Articles archived by **When finished** are left out and progress made on the device is shown. Also available as the gesture action **Instapaper: continue last list**
+- **Continue** — for an hour after you last used a list (until KOReader restarts), **Continue: <folder> (page N)** at the top of the Instapaper menu reopens it where you left off, without a network request. Articles archived by **When finished** are left out and progress made on the device is shown. Also available as the gesture action **Instapaper: continue last list**; when there is nothing recent to continue, the gesture opens the last used folder (or Unread) fresh from the server and says so
 - **Send to Instapaper** — Add web links to Instapaper directly from document link popups
 - **Offline queue** — Links are queued when offline and automatically sent when network becomes available
 - **Auto WiFi connect for links** — Configurable automatic network connection when adding links
