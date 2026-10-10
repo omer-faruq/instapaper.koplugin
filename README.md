@@ -186,6 +186,12 @@ Select **Settings** from the Instapaper menu to configure:
   - **None** (default) — No action, article stays in its current folder
   - **Archive only** — Move article to Archive folder
   - **Archive + Mark read** — Move to Archive and mark as 100% read
+- **When finished** — Action when you close an article you have finished (last page reached, or marked as finished in KOReader):
+  - **None** (default) — No action
+  - **Archive** — Move the article to the Archive folder
+  - **Archive + Delete file** — Archive it, then delete the downloaded file and its sidecar from the device
+
+  Works offline: the article is archived (and deleted) the next time the device is online.
 - **Auto connect network** — When adding links to Instapaper:
   - **ON** (default) — Automatically open network connection and send immediately
   - **OFF** — Add to pending queue without connecting; links are sent when network is opened elsewhere

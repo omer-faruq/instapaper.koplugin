@@ -503,6 +503,7 @@ function Instapaper:onReaderReady()
                 self:drainPendingQueue({ silent = true })
             end
             self:drainProgressQueue()
+            self:drainFinishedQueue()
         end)
     end
 end
@@ -517,6 +518,7 @@ function Instapaper:onNetworkConnected()
             self:drainPendingQueue({ silent = false })
         end
         self:drainProgressQueue()
+        self:drainFinishedQueue()
     end)
 end
 
@@ -527,6 +529,7 @@ function Instapaper:onResume()
     if NetworkMgr:isOnline() then
         UIManager:scheduleIn(1, function()
             self:drainProgressQueue()
+            self:drainFinishedQueue()
         end)
     end
 end
@@ -540,6 +543,7 @@ function Instapaper:onCloseDocument()
     -- CloseDocument is emitted while the reader still exposes the live reading
     -- position. Queue first, then send immediately only when already online.
     self:captureCurrentReadingProgress(true)
+    self:queueFinishedCurrentDocument()
 end
 
 function Instapaper:loadSettings()
@@ -559,6 +563,7 @@ function Instapaper:loadSettings()
     local designed_cover    = self.settings:readSetting("designed_cover")
     self.designed_cover     = (designed_cover == nil) and true or designed_cover
     self.after_download_action = self.settings:readSetting("after_download_action") or "none"
+    self.after_finish_action = self.settings:readSetting("after_finish_action") or "none"
     self.cache_folder       = self.settings:readSetting("cache_folder")
     self.auto_connect_network = self.settings:readSetting("auto_connect_network")
     if self.auto_connect_network == nil then
@@ -579,6 +584,7 @@ function Instapaper:saveSettings()
     self.settings:saveSetting("include_images",     self.include_images)
     self.settings:saveSetting("designed_cover",     self.designed_cover)
     self.settings:saveSetting("after_download_action", self.after_download_action)
+    self.settings:saveSetting("after_finish_action", self.after_finish_action)
     self.settings:saveSetting("cache_folder",       self.cache_folder)
     self.settings:saveSetting("auto_connect_network", self.auto_connect_network)
     self.settings:flush()
@@ -909,6 +915,8 @@ function Instapaper:writeInstapaperDocumentIdentity(filepath, bookmark)
             "instapaper_bookmark_id",
             tostring(bookmark.bookmark_id)
         )
+        -- A fresh download is a new reading pass: let finishing it count again.
+        doc_settings:delSetting("instapaper_finished_queued")
 
         if bookmark.progress ~= nil then
             doc_settings:saveSetting(
@@ -931,6 +939,178 @@ function Instapaper:writeInstapaperDocumentIdentity(filepath, bookmark)
         logger.warn(
             "Instapaper progress sync: could not write document identity for",
             tostring(filepath), tostring(err))
+    end
+end
+
+--------------------------------------------------------------------
+-- After finishing an article
+--------------------------------------------------------------------
+
+-- Finished articles waiting to be archived (and optionally deleted locally),
+-- keyed by bookmark_id. Like pending_progress, this is account-scoped and
+-- survives restarts so an offline close is archived on the next connection.
+local FINISHED_MAX_ATTEMPTS = 5
+
+function Instapaper:getPendingFinished()
+    if not self.settings then
+        return {}
+    end
+    local pending = self.settings:readSetting("pending_finished")
+    if type(pending) ~= "table" then
+        return {}
+    end
+    return pending
+end
+
+function Instapaper:savePendingFinished(pending)
+    if not self.settings then
+        return
+    end
+    self.settings:saveSetting("pending_finished", pending or {})
+    self.settings:flush()
+end
+
+-- Finished = marked as finished in KOReader, or the end of the text reached.
+function Instapaper:isCurrentDocumentFinished()
+    local ok, finished = pcall(function()
+        local summary = self.ui.doc_settings:readSetting("summary")
+        if type(summary) == "table" and summary.status == "complete" then
+            return true
+        end
+
+        local progress = self:getCurrentReadingProgress()
+        if progress and progress >= 0.99 then
+            return true
+        end
+
+        -- In scroll mode the percentage is taken from the top of the screen,
+        -- so it never reaches 100%: check whether the bottom is visible.
+        local rolling = self.ui.rolling
+        if rolling and self.ui.view and self.ui.view.view_mode ~= "page" then
+            local doc_height = self.ui.document.info.doc_height
+            local Screen = require("device").screen
+            return doc_height and rolling.current_pos
+                and rolling.current_pos + Screen:getHeight() >= doc_height
+        end
+        return false
+    end)
+    return ok and finished or false
+end
+
+function Instapaper:queueFinishedCurrentDocument()
+    local action = self.after_finish_action
+    if action ~= "archive" and action ~= "delete" then
+        return
+    end
+    local bookmark_id = self:getCurrentInstapaperBookmarkId()
+    if not bookmark_id or not self:isLoggedIn() then
+        return
+    end
+    if self.ui.doc_settings:isTrue("instapaper_finished_queued")
+            or not self:isCurrentDocumentFinished() then
+        return
+    end
+
+    local pending = self:getPendingFinished()
+    pending[bookmark_id] = {
+        bookmark_id = bookmark_id,
+        filepath = action == "delete" and self.ui.document.file or nil,
+    }
+    self:savePendingFinished(pending)
+
+    -- ReaderUI has already saved the sidecar before CloseDocument, so flush
+    -- again to keep the flag. It stops re-archiving on every later close.
+    pcall(function()
+        self.ui.doc_settings:saveSetting("instapaper_finished_queued", true)
+        self.ui.doc_settings:flush()
+    end)
+
+    -- Run after the reader has closed: the file cannot be deleted while open.
+    if NetworkMgr:isOnline() then
+        UIManager:scheduleIn(1, function()
+            self:drainFinishedQueue()
+        end)
+    end
+end
+
+-- Returns true once the file is gone, false to retry later.
+function Instapaper:deleteLocalArticle(filepath)
+    if lfs.attributes(filepath, "mode") ~= "file" then
+        return true
+    end
+    local ReaderUI = require("apps/reader/readerui")
+    if ReaderUI.instance and ReaderUI.instance.document
+            and ReaderUI.instance.document.file == filepath then
+        return false
+    end
+
+    -- FileManager's helper also removes the sidecar and the history and
+    -- collection entries; it does not use self for a single file.
+    local FileManager = require("apps/filemanager/filemanager")
+    if not FileManager.deleteFile(FileManager.instance or FileManager, filepath, true) then
+        return false
+    end
+    if FileManager.instance then
+        FileManager.instance:onRefresh()
+    end
+    return true
+end
+
+function Instapaper:drainFinishedQueue()
+    if self._finished_queue_draining
+            or not self:isLoggedIn()
+            or not NetworkMgr:isOnline() then
+        return
+    end
+
+    local ids = {}
+    for bookmark_id in pairs(self:getPendingFinished()) do
+        ids[#ids + 1] = bookmark_id
+    end
+    if #ids == 0 then
+        return
+    end
+
+    self._finished_queue_draining = true
+
+    local ok, err = pcall(function()
+        for _, bookmark_id in ipairs(ids) do
+            if not NetworkMgr:isOnline() then
+                break
+            end
+
+            local pending = self:getPendingFinished()
+            local item = pending[bookmark_id]
+            if type(item) == "table" then
+                if not item.archived then
+                    local call_ok, archived, archive_err = pcall(
+                        self.apiBookmarkAction, self, "archive", bookmark_id)
+                    if call_ok and archived then
+                        item.archived = true
+                    else
+                        logger.warn("Instapaper: archive after finishing failed",
+                            bookmark_id, tostring(archive_err or archived))
+                        item.attempts = (tonumber(item.attempts) or 0) + 1
+                        if item.attempts >= FINISHED_MAX_ATTEMPTS then
+                            pending[bookmark_id] = nil
+                        end
+                    end
+                end
+
+                -- Delete only after the server has the article archived.
+                if item.archived and (not item.filepath
+                        or self:deleteLocalArticle(item.filepath)) then
+                    pending[bookmark_id] = nil
+                end
+                self:savePendingFinished(pending)
+            end
+        end
+    end)
+
+    self._finished_queue_draining = false
+
+    if not ok then
+        logger.warn("Instapaper: finished queue error", tostring(err))
     end
 end
 
@@ -1150,6 +1330,7 @@ function Instapaper:showSettingsDialog()
     local designed_cover = self.designed_cover
     if designed_cover == nil then designed_cover = true end
     local after_download_action = self.after_download_action or "none"
+    local after_finish_action = self.after_finish_action or "none"
     local cache_folder = self.cache_folder
     local auto_connect = self.auto_connect_network
     if auto_connect == nil then
@@ -1176,6 +1357,14 @@ function Instapaper:showSettingsDialog()
         else
             action_label = _("None")
         end
+        local finish_label
+        if after_finish_action == "archive" then
+            finish_label = _("Archive")
+        elseif after_finish_action == "delete" then
+            finish_label = _("Archive + Delete file")
+        else
+            finish_label = _("None")
+        end
         
         local cache_label
         if cache_folder and cache_folder ~= "" then
@@ -1197,6 +1386,7 @@ function Instapaper:showSettingsDialog()
                 .. "\n" .. _("Include images (EPUB): ") .. img_label
                 .. "\n" .. _("Designed cover (EPUB): ") .. cover_label
                 .. "\n" .. _("After download: ") .. action_label
+                .. "\n" .. _("When finished: ") .. finish_label
                 .. "\n" .. _("Auto connect network: ") .. auto_label
                 .. "\n" .. _("Cache folder: ") .. cache_label
                 .. "\n" .. _("API: ") .. api_version,
@@ -1247,6 +1437,19 @@ function Instapaper:showSettingsDialog()
                             rebuildSettingsDialog()
                         end,
                     },
+                    {
+                        text = _("< When finished >"),
+                        callback = function()
+                            if after_finish_action == "none" then
+                                after_finish_action = "archive"
+                            elseif after_finish_action == "archive" then
+                                after_finish_action = "delete"
+                            else
+                                after_finish_action = "none"
+                            end
+                            rebuildSettingsDialog()
+                        end,
+                    },
                 },
                 {
                     {
@@ -1292,6 +1495,7 @@ function Instapaper:showSettingsDialog()
                             self.include_images = include_images
                             self.designed_cover = designed_cover
                             self.after_download_action = after_download_action
+                            self.after_finish_action = after_finish_action
                             self.auto_connect_network = auto_connect
                             self.cache_folder = cache_folder
                             if api_version ~= (self:usesV2() and "v2" or "v1") then
@@ -1609,6 +1813,7 @@ function Instapaper:logout()
     -- Queued bookmark ids belong to the current Instapaper account.
     if self.settings then
         self.settings:saveSetting("pending_progress", {})
+        self.settings:saveSetting("pending_finished", {})
     end
     self:saveSettings()
     UIManager:show(InfoMessage:new{
