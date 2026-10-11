@@ -52,6 +52,9 @@ end
 -- default, and a failed one ends the run instead of trying every item.
 local BACKGROUND_BLOCK_TIMEOUT = 5
 local BACKGROUND_TOTAL_TIMEOUT = 10
+
+-- Archive attempts for a finished article before it is dropped from the queue.
+local FINISHED_MAX_ATTEMPTS = 5
 local background_depth = 0
 
 local function inBackground(fn)
@@ -599,10 +602,177 @@ function Instapaper:onReaderReady()
     end
 end
 
+local pack = table.pack or function(...) return { n = select("#", ...), ... } end
+local unpack = table.unpack or unpack
+
+-- In a forked child: the child's settings writes would race the parent's
+-- copy, so flushing is off in there. API state it changes is sent back
+-- instead (childApiState / adoptApiState).
+local function muteChildSettings(plugin)
+    local function noFlush() end
+    if plugin.settings then
+        plugin.settings.flush = noFlush
+    end
+    if plugin.pending_pool then
+        plugin.pending_pool.flush = noFlush
+    end
+end
+
+local function childApiState(plugin)
+    return { api_version = plugin.api_version, v2_confirmed = plugin.v2_confirmed }
+end
+
+-- Only plain data crosses the pipe (string.buffer cannot encode functions or
+-- userdata, which a JSON null may be).
+local function plainCopy(value, depth)
+    local kind = type(value)
+    if kind == "string" or kind == "number" or kind == "boolean" then
+        return value
+    end
+    if kind ~= "table" or (depth or 0) > 20 then
+        return nil
+    end
+    local copy = {}
+    for k, v in pairs(value) do
+        if type(k) == "string" or type(k) == "number" then
+            copy[k] = plainCopy(v, (depth or 0) + 1)
+        end
+    end
+    return copy
+end
+
+-- The plugin instance of whatever is on screen now. A closed reader's instance
+-- only lives on in callbacks it scheduled, and its settings copy is stale by
+-- then: queue edits go through the live one.
+local function liveInstance(fallback)
+    local ReaderUI = require("apps/reader/readerui")
+    local FileManager = require("apps/filemanager/filemanager")
+    local ui = ReaderUI.instance or FileManager.instance
+    return ui and ui.instapaper or fallback
+end
+
+-- One detached sync at a time, shared by the reader's and the file manager's
+-- instances. A sync asked for while one runs is folded into a single rerun.
+local detached_sync = { running = false, again = nil }
+
 -- Sends whatever is queued. Costs nothing when every queue is empty.
 -- opts.pending: also send the pending URL pool; opts.silent: no report for it.
+-- The requests run in a forked process: on the UI thread a single one held
+-- the screen for 7 s. The child only talks to the server; the queues are
+-- edited here once it reports back. Without fork, sends on the UI thread.
 function Instapaper:backgroundSync(opts)
     opts = opts or {}
+    if detached_sync.running then
+        local again = detached_sync.again or { silent = true }
+        again.pending = again.pending or opts.pending
+        again.silent = again.silent and opts.silent and true or false
+        detached_sync.again = again
+        return
+    end
+    if not self:isLoggedIn() or not hasNetwork() then
+        return
+    end
+
+    local jobs = self:collectSyncJobs(opts)
+    if not jobs then
+        return
+    end
+    if #jobs.urls + #jobs.progress + #jobs.archive == 0 then
+        -- Only local work left (deleting archived articles).
+        self:applySyncResults({}, opts)
+        return
+    end
+
+    local pid, read_fd
+    if type(FFIUtil.runInSubProcess) == "function" then
+        pid, read_fd = FFIUtil.runInSubProcess(function(_pid, child_write_fd)
+            local ok, done = pcall(self.runSyncJobs, self, jobs)
+            FFIUtil.writeToFD(child_write_fd, ok and JSON.encode(done) or "", true)
+        end, true)
+    end
+    if not pid then
+        self:syncInForeground(opts)
+        return
+    end
+
+    detached_sync.running = true
+    local function collect()
+        if not FFIUtil.isSubProcessDone(pid) then
+            UIManager:scheduleIn(1, collect)
+            return
+        end
+        detached_sync.running = false
+        local live = liveInstance(self)
+        local decoded, done = pcall(JSON.decode, FFIUtil.readAllFromFD(read_fd))
+        if decoded and type(done) == "table" then
+            local ok, err = pcall(live.applySyncResults, live, done, opts)
+            if not ok then
+                logger.warn("Instapaper: applying sync results failed", tostring(err))
+            end
+        else
+            logger.warn("Instapaper: background sync process returned nothing")
+        end
+        local again = detached_sync.again
+        detached_sync.again = nil
+        if again then
+            live:backgroundSync(again)
+        end
+    end
+    UIManager:scheduleIn(1, collect)
+end
+
+-- What a child changed about the API (v2 confirmed, switched to v1 after a
+-- rejection) and could not save itself.
+function Instapaper:adoptApiState(state)
+    if type(state) ~= "table" or not self.settings then
+        return
+    end
+    local changed = false
+    if state.api_version and state.api_version ~= self.api_version then
+        self.api_version = state.api_version
+        self.settings:saveSetting("api_version", self.api_version)
+        changed = true
+    end
+    if state.v2_confirmed and not self.v2_confirmed then
+        self.v2_confirmed = true
+        self.settings:saveSetting("v2_confirmed", true)
+        changed = true
+    end
+    if changed then
+        self.settings:flush()
+    end
+end
+
+-- Run fn(self) in a forked process behind a message saying `text`, so a slow
+-- server (11 s seen for one list) does not freeze the screen and a tap on the
+-- message cancels. on_done(...) then gets fn's results, on a later tick and
+-- outside Trapper's coroutine (which would swallow its errors). When
+-- cancelled, on_cancel() runs instead, if given.
+function Instapaper:runDetached(text, fn, on_done, on_cancel)
+    local Trapper = require("ui/trapper")
+    Trapper:wrap(function()
+        local completed, result = Trapper:dismissableRunInSubprocess(function()
+            muteChildSettings(self)
+            local results = pack(fn(self))
+            return { results = plainCopy(results), api = childApiState(self) }
+        end, text .. "\n\n" .. _("Tap to cancel."))
+        if not completed or type(result) ~= "table" or type(result.results) ~= "table" then
+            -- Cancelled (or the fork failed, which Trapper reports the same way).
+            logger.info("Instapaper: request cancelled or failed:", text)
+            if on_cancel then
+                UIManager:nextTick(on_cancel)
+            end
+            return
+        end
+        UIManager:nextTick(function()
+            self:adoptApiState(result.api)
+            on_done(unpack(result.results, 1, result.results.n))
+        end)
+    end)
+end
+
+-- The old way, for when fork is unavailable.
+function Instapaper:syncInForeground(opts)
     inBackground(function()
         if opts.pending and self:countPending() > 0 then
             self:drainPendingQueue({ silent = opts.silent })
@@ -612,11 +782,166 @@ function Instapaper:backgroundSync(opts)
     end)
 end
 
+-- Snapshot of the queues for the child. nil when there is nothing to do.
+function Instapaper:collectSyncJobs(opts)
+    local jobs = { urls = {}, progress = {}, archive = {} }
+
+    if opts.pending then
+        for _, item in ipairs(self:getPendingUrls()) do
+            jobs.urls[#jobs.urls + 1] = {
+                url = item.url, title = item.title, added_at = item.added_at,
+            }
+        end
+    end
+
+    local pending = self:getPendingProgress()
+    local malformed = false
+    for bookmark_id, item in pairs(pending) do
+        local progress = type(item) == "table" and tonumber(item.progress)
+        local timestamp = type(item) == "table" and tonumber(item.progress_timestamp)
+        if progress and timestamp then
+            jobs.progress[#jobs.progress + 1] = {
+                bookmark_id = bookmark_id, progress = progress, timestamp = timestamp,
+            }
+        else
+            -- Discard rather than retry forever.
+            pending[bookmark_id] = nil
+            malformed = true
+        end
+    end
+    if malformed then
+        self:savePendingProgress(pending)
+    end
+
+    local local_work = false
+    for bookmark_id, item in pairs(self:getPendingFinished()) do
+        if type(item) == "table" then
+            if item.archived then
+                local_work = true
+            else
+                jobs.archive[#jobs.archive + 1] = bookmark_id
+            end
+        end
+    end
+
+    if #jobs.urls + #jobs.progress + #jobs.archive == 0 and not local_work then
+        return nil
+    end
+    return jobs
+end
+
+-- Runs in the forked child: requests only, the queues are edited by the
+-- parent. Each queue stops at its first failure, like the background drains.
+function Instapaper:runSyncJobs(jobs)
+    muteChildSettings(self)
+
+    local done = { urls = {}, progress = {}, archived = {}, archive_failed = {} }
+    for _, item in ipairs(jobs.urls) do
+        if not self:addBookmark(item.url, item.title) then
+            break
+        end
+        done.urls[#done.urls + 1] = item
+    end
+    for _, item in ipairs(jobs.progress) do
+        if not self:sendReadingProgress(item.bookmark_id, item.progress, item.timestamp) then
+            break
+        end
+        done.progress[#done.progress + 1] = item
+    end
+    for _, bookmark_id in ipairs(jobs.archive) do
+        local call_ok, archived, err = pcall(self.apiBookmarkAction, self, "archive", bookmark_id)
+        if not (call_ok and archived) then
+            logger.warn("Instapaper: archive after finishing failed",
+                bookmark_id, tostring(err or archived))
+            done.archive_failed[#done.archive_failed + 1] = bookmark_id
+            break
+        end
+        done.archived[#done.archived + 1] = bookmark_id
+    end
+    done.api = childApiState(self)
+    return done
+end
+
+-- Back in the parent: take what went through off the queues. Re-reads every
+-- queue, so entries added while the child ran are kept.
+function Instapaper:applySyncResults(done, opts)
+    self:adoptApiState(done.api)
+    for _, item in ipairs(done.progress or {}) do
+        self:removeQueuedReadingProgress(item.bookmark_id, tonumber(item.timestamp) or 0)
+    end
+
+    local archived, failed = {}, {}
+    for _, bookmark_id in ipairs(done.archived or {}) do
+        archived[tostring(bookmark_id)] = true
+    end
+    for _, bookmark_id in ipairs(done.archive_failed or {}) do
+        failed[tostring(bookmark_id)] = true
+    end
+    local finished = self:getPendingFinished()
+    local changed = false
+    for bookmark_id, item in pairs(finished) do
+        if type(item) == "table" then
+            if archived[bookmark_id] then
+                item.archived = true
+                changed = true
+            elseif failed[bookmark_id] then
+                item.attempts = (tonumber(item.attempts) or 0) + 1
+                if item.attempts >= FINISHED_MAX_ATTEMPTS then
+                    finished[bookmark_id] = nil
+                end
+                changed = true
+            end
+            -- Delete only after the server has the article archived.
+            if item.archived and (not item.filepath
+                    or self:deleteLocalArticle(item.filepath)) then
+                finished[bookmark_id] = nil
+                changed = true
+            end
+        end
+    end
+    if changed then
+        self:savePendingFinished(finished)
+    end
+
+    local sent_urls = done.urls or {}
+    if #sent_urls == 0 and not (opts.pending and not opts.silent) then
+        return
+    end
+    local sent = {}
+    for _, item in ipairs(sent_urls) do
+        sent[tostring(item.url) .. "\0" .. tostring(item.added_at)] = true
+    end
+    local remaining = {}
+    for _, item in ipairs(self:getPendingUrls()) do
+        if not sent[tostring(item.url) .. "\0" .. tostring(item.added_at)] then
+            remaining[#remaining + 1] = item
+        end
+    end
+    if #sent_urls > 0 then
+        self:savePendingUrls(remaining)
+    end
+
+    if opts.silent or not opts.pending then
+        return
+    end
+    local parts = {}
+    if #sent_urls > 0 then
+        parts[#parts + 1] = T(_("Sent %1 pending URL(s) to Instapaper."), #sent_urls)
+    end
+    if #remaining > 0 then
+        parts[#parts + 1] = T(_("%1 still pending."), #remaining)
+    end
+    if #parts > 0 then
+        local Notification = require("ui/widget/notification")
+        UIManager:show(Notification:new{ text = table.concat(parts, " ") })
+    end
+end
+
 function Instapaper:onNetworkConnected()
     UIManager:scheduleIn(1, function()
         -- If an Instapaper article is currently open, include its current
         -- position in the batch that is about to be sent.
-        self:captureCurrentReadingProgress(false)
+        self:captureCurrentReadingProgress()
         self:backgroundSync({ pending = true, silent = false })
     end)
 end
@@ -634,14 +959,16 @@ end
 
 function Instapaper:onSuspend()
     -- Persist locally only. Avoid blocking suspend on a network request.
-    self:captureCurrentReadingProgress(false)
+    self:captureCurrentReadingProgress()
 end
 
 function Instapaper:onCloseDocument()
     -- CloseDocument is emitted while the reader still exposes the live reading
-    -- position. Queue first, then send immediately only when already online.
-    self:captureCurrentReadingProgress(true)
+    -- position. Queue it, then send without holding the close up. The results
+    -- come back after the reader is gone, so a finished article can be deleted.
+    self:captureCurrentReadingProgress()
     self:queueFinishedCurrentDocument()
+    self:backgroundSync()
 
     -- Reading an article opened from a list counts as using that list, so
     -- "Continue" is still offered for an hour after a long read.
@@ -967,7 +1294,7 @@ function Instapaper:restoreRemoteReadingProgress()
         bookmark_id, string.format("%.1f%%", remote_progress * 100))
 end
 
-function Instapaper:captureCurrentReadingProgress(send_if_online)
+function Instapaper:captureCurrentReadingProgress()
     local bookmark_id = self:getCurrentInstapaperBookmarkId()
     if not bookmark_id then
         return
@@ -993,13 +1320,6 @@ function Instapaper:captureCurrentReadingProgress(send_if_online)
         self:queueReadingProgress(bookmark_id, progress, timestamp)
     end
 
-    if send_if_online and self:isLoggedIn() and hasNetwork() then
-        inBackground(function()
-            if self:sendReadingProgress(bookmark_id, progress, timestamp) then
-                self:removeQueuedReadingProgress(bookmark_id, timestamp)
-            end
-        end)
-    end
 end
 
 -- Store the remote bookmark id in KOReader's normal per-document sidecar.
@@ -1053,7 +1373,7 @@ end
 -- Finished articles waiting to be archived (and optionally deleted locally),
 -- keyed by bookmark_id. Like pending_progress, this is account-scoped and
 -- survives restarts so an offline close is archived on the next connection.
-local FINISHED_MAX_ATTEMPTS = 5
+-- (FINISHED_MAX_ATTEMPTS is declared at the top: backgroundSync uses it too.)
 
 function Instapaper:getPendingFinished()
     if not self.settings then
@@ -1129,13 +1449,7 @@ function Instapaper:queueFinishedCurrentDocument()
         self.ui.doc_settings:saveSetting("instapaper_finished_queued", true)
         self.ui.doc_settings:flush()
     end)
-
-    -- Run after the reader has closed: the file cannot be deleted while open.
-    if hasNetwork() then
-        UIManager:scheduleIn(1, function()
-            inBackground(function() self:drainFinishedQueue() end)
-        end)
-    end
+    -- The callers send it with backgroundSync().
 end
 
 -- Returns true once the file is gone, false to retry later.
@@ -1907,38 +2221,31 @@ local LAST_LIST_TTL = 3600
 
 -- loading_text: shown instead of "Fetching articles..." while loading.
 function Instapaper:fetchAndShowArticles(folder_id, folder_name, loading_text)
-    local info = InfoMessage:new{
-        text = loading_text or _("Fetching articles..."),
-    }
-    UIManager:show(info)
-    UIManager:forceRePaint()
-
     local page_size = self:usesV2() and V2_LIST_PAGE_SIZE or (self.article_limit or 50)
-    local ok, bookmarks, page_count, total = self:apiListBookmarks(folder_id, page_size)
-    if not ok then
-        UIManager:close(info)
-        UIManager:show(InfoMessage:new{
-            text = T(_("Failed to fetch articles: %1"), bookmarks),
-        })
-        return
-    end
+    self:runDetached(loading_text or _("Fetching articles..."), function(this)
+        return this:apiListBookmarks(folder_id, page_size)
+    end, function(ok, bookmarks, page_count, total)
+        if not ok then
+            UIManager:show(InfoMessage:new{
+                text = T(_("Failed to fetch articles: %1"), bookmarks),
+            })
+            return
+        end
 
-    if #bookmarks == 0 then
-        UIManager:close(info)
-        UIManager:show(InfoMessage:new{
-            text = _("No articles found."),
-        })
-        return
-    end
+        if #bookmarks == 0 then
+            UIManager:show(InfoMessage:new{
+                text = _("No articles found."),
+            })
+            return
+        end
 
-    UIManager:close(info)
-    UIManager:forceRePaint()
-    self:showArticleMenu(bookmarks, folder_id, folder_name, {
-        offset = page_count,
-        total = total,
-        page_size = page_size,
-        last_page_count = page_count,
-    })
+        self:showArticleMenu(bookmarks, folder_id, folder_name, {
+            offset = page_count,
+            total = total,
+            page_size = page_size,
+            last_page_count = page_count,
+        })
+    end)
 end
 
 -- The last list shown, if it was used within LAST_LIST_TTL (or at all, with
@@ -2019,8 +2326,9 @@ function Instapaper:returnToListFromArticle()
     end
     -- The article is still open underneath, so CloseDocument has not run:
     -- record its progress and "When finished" now, for the list to show.
-    self:captureCurrentReadingProgress(false)
+    self:captureCurrentReadingProgress()
     self:queueFinishedCurrentDocument()
+    self:backgroundSync()
     self:continueLastList({
         ignore_ttl = true,
         -- Leaving the list must not drop back into the article: that would
@@ -2097,7 +2405,7 @@ function Instapaper:showArticleMenu(bookmarks, folder_id, folder_name, paging, i
                 _bookmark = bm,
                 callback = function()
                     NetworkMgr:runWhenOnline(function()
-                        self:downloadAndOpenArticle(bm)
+                        self:downloadAndOpenArticle(bm, menu)
                     end)
                 end,
                 hold_callback = function()
@@ -2133,13 +2441,7 @@ function Instapaper:showArticleMenu(bookmarks, folder_id, folder_name, paging, i
         state.time = os.time()
     end
 
-    local function loadMore()
-        local info = InfoMessage:new{ text = _("Fetching articles...") }
-        UIManager:show(info)
-        UIManager:forceRePaint()
-        local ok, page, page_count, total = self:apiListBookmarks(
-            folder_id, paging.page_size, paging.offset)
-        UIManager:close(info)
+    local function applyMore(ok, page, page_count, total)
         if not ok then
             UIManager:show(InfoMessage:new{
                 text = T(_("Failed to fetch articles: %1"), page),
@@ -2168,21 +2470,17 @@ function Instapaper:showArticleMenu(bookmarks, folder_id, folder_name, paging, i
         remember(firstItemOnPage())
     end
 
+    local function loadMore()
+        self:runDetached(_("Fetching articles..."), function(this)
+            return this:apiListBookmarks(folder_id, paging.page_size, paging.offset)
+        end, applyMore)
+    end
+
     -- Reload what is loaded so far with the server's current data. New
     -- articles arrive at the top, so jump there when there are any; otherwise
     -- stay on the same page and say so. silent: the reload after Archive or
     -- Delete, which only has to stay put.
-    local function refresh(silent)
-        local limit = paging.page_size
-        if self:usesV2() then
-            limit = math.min(math.max(paging.offset, paging.page_size),
-                V2_LIST_MAX_PAGE_SIZE)
-        end
-        local info = InfoMessage:new{ text = _("Fetching articles...") }
-        UIManager:show(info)
-        UIManager:forceRePaint()
-        local ok, page, page_count, total = self:apiListBookmarks(folder_id, limit)
-        UIManager:close(info)
+    local function applyRefresh(silent, ok, page, page_count, total)
         if not ok then
             UIManager:show(InfoMessage:new{
                 text = T(_("Failed to fetch articles: %1"), page),
@@ -2230,6 +2528,19 @@ function Instapaper:showArticleMenu(bookmarks, folder_id, folder_name, paging, i
         end
     end
 
+    local function refresh(silent)
+        local limit = paging.page_size
+        if self:usesV2() then
+            limit = math.min(math.max(paging.offset, paging.page_size),
+                V2_LIST_MAX_PAGE_SIZE)
+        end
+        self:runDetached(_("Fetching articles..."), function(this)
+            return this:apiListBookmarks(folder_id, limit)
+        end, function(...)
+            applyRefresh(silent, ...)
+        end)
+    end
+
     menu = Menu:new{
         title = buildTitle(),
         item_table = buildItems(),
@@ -2255,9 +2566,13 @@ function Instapaper:showArticleMenu(bookmarks, folder_id, folder_name, paging, i
                 NetworkMgr:runWhenOnline(loadMore)
                 return true
             end
-            -- An article was picked: close_callback is about to run, but
-            -- this is not leaving the list.
-            menu._picked = true
+            -- An article was picked: the list stays up while it downloads,
+            -- so a failed or cancelled download leaves the user in it.
+            -- downloadAndOpenArticle closes it once the article opens.
+            if item and type(item.callback) == "function" then
+                item.callback()
+                return true
+            end
             return Menu.onMenuSelect(menu_self, item)
         end,
         onMenuHold = function(_, item)
@@ -2341,7 +2656,7 @@ function Instapaper:showArticleActions(bookmark, parent_menu, folder_id)
                     callback = function()
                         UIManager:close(actions_dialog)
                         NetworkMgr:runWhenOnline(function()
-                            self:downloadAndOpenArticle(bookmark)
+                            self:downloadAndOpenArticle(bookmark, parent_menu)
                         end)
                     end,
                 },
@@ -2547,70 +2862,54 @@ function Instapaper:saveArticle(bookmark, html)
     return filepath
 end
 
--- Download only (no open), keeps caller menu open
-function Instapaper:downloadArticleOnly(bookmark)
-    -- Painted before the blocking fetch, and closed by hand afterwards: a
-    -- timeout alone would never make it to the screen.
-    local info = InfoMessage:new{
-        text = _("Downloading article..."),
-    }
-    UIManager:show(info)
-    UIManager:forceRePaint()
-
-    local html, err = self:fetchArticleHtml(bookmark)
-    if not html then
-        UIManager:close(info)
-        UIManager:show(InfoMessage:new{
-            text = T(_("Download failed: %1"), tostring(err)),
-        })
-        return
-    end
-
-    local filepath = self:saveArticle(bookmark, html)
-    UIManager:close(info)
-    if not filepath then
-        UIManager:show(InfoMessage:new{
-            text = _("Could not save article file."),
-        })
-        return
-    end
-
-    local short_title = (bookmark.title or "article"):sub(1, 40)
-    UIManager:show(InfoMessage:new{
-        text = T(_("Saved: %1"), short_title),
-        timeout = 2,
-    })
-
-    self:runAfterDownloadAction(bookmark)
+-- Fetch, save (EPUB building included) and the after-download action, all in
+-- a forked child: only files are written there, which the parent reads fresh.
+-- on_done(filepath) runs on the UI thread; failures are reported here.
+function Instapaper:downloadArticleDetached(bookmark, on_done)
+    self:runDetached(_("Downloading article..."), function(this)
+        local html, err = this:fetchArticleHtml(bookmark)
+        if not html then
+            return nil, T(_("Download failed: %1"), tostring(err))
+        end
+        local filepath = this:saveArticle(bookmark, html)
+        if not filepath then
+            return nil, _("Could not save article file.")
+        end
+        this:runAfterDownloadAction(bookmark)
+        return filepath
+    end, function(filepath, err)
+        if not filepath then
+            UIManager:show(InfoMessage:new{ text = err or _("Could not save article file.") })
+            return
+        end
+        on_done(filepath)
+    end)
 end
 
-function Instapaper:downloadAndOpenArticle(bookmark)
-    local info = InfoMessage:new{
-        text = _("Downloading article..."),
-    }
-    UIManager:show(info)
-    UIManager:forceRePaint()
-
-    local html, err = self:fetchArticleHtml(bookmark)
-    if not html then
-        UIManager:close(info)
+-- Download only (no open), keeps caller menu open
+function Instapaper:downloadArticleOnly(bookmark)
+    self:downloadArticleDetached(bookmark, function()
+        local short_title = (bookmark.title or "article"):sub(1, 40)
         UIManager:show(InfoMessage:new{
-            text = T(_("Download failed: %1"), tostring(err)),
+            text = T(_("Saved: %1"), short_title),
+            timeout = 2,
         })
-        return
-    end
+    end)
+end
 
-    local filepath = self:saveArticle(bookmark, html)
-    UIManager:close(info)
-    if not filepath then
-        UIManager:show(InfoMessage:new{
-            text = _("Could not save article file."),
-        })
-        return
-    end
+-- list_menu: the article list it was picked from, closed once the article
+-- opens. That is moving on to the article, not leaving the list for good.
+function Instapaper:downloadAndOpenArticle(bookmark, list_menu)
+    self:downloadArticleDetached(bookmark, function(filepath)
+        if list_menu and type(list_menu.close_callback) == "function" then
+            list_menu._picked = true
+            list_menu.close_callback()
+        end
+        self:openDownloadedArticle(filepath)
+    end)
+end
 
-    self:runAfterDownloadAction(bookmark)
-
+function Instapaper:openDownloadedArticle(filepath)
     -- Open in KOReader; marked so the reader offers a way back to the list.
     ReaderReturn.markArticle(filepath)
     local ReaderUI = require("apps/reader/readerui")
@@ -2760,12 +3059,14 @@ function Instapaper:fetchUserFolders()
 end
 
 function Instapaper:fetchAndShowUserFolders()
-    UIManager:show(InfoMessage:new{
-        text = _("Fetching folders..."),
-        timeout = 1,
-    })
+    self:runDetached(_("Fetching folders..."), function(this)
+        return this:fetchUserFolders()
+    end, function(folders)
+        self:showUserFolders(folders)
+    end)
+end
 
-    local folders = self:fetchUserFolders()
+function Instapaper:showUserFolders(folders)
     if not folders then
         UIManager:show(InfoMessage:new{
             text = _("Failed to fetch folders."),
@@ -2826,23 +3127,23 @@ function Instapaper:showBulkDownloadDialog()
         selected_folder = builtin_folders[1]
     end
 
-    local function fetchFolderChoices()
-        local info = InfoMessage:new{ text = _("Fetching folders...") }
-        UIManager:show(info)
-        UIManager:forceRePaint()
-        local user_folders = self:fetchUserFolders()
-        UIManager:close(info)
-        if user_folders then
-            self.settings:saveSetting("bulk_folders", user_folders)
-            self.settings:flush()
-        else
-            -- Offline or failed: fall back to the last list we got.
-            user_folders = self.settings:readSetting("bulk_folders") or {}
+    local function fetchFolderChoices(on_choices)
+        local function deliver(user_folders)
+            if user_folders then
+                self.settings:saveSetting("bulk_folders", user_folders)
+                self.settings:flush()
+            else
+                -- Offline, failed or cancelled: fall back to the last list we got.
+                user_folders = self.settings:readSetting("bulk_folders") or {}
+            end
+            local choices = {}
+            for _, f in ipairs(builtin_folders) do choices[#choices + 1] = f end
+            for _, f in ipairs(user_folders) do choices[#choices + 1] = f end
+            on_choices(choices)
         end
-        local choices = {}
-        for _, f in ipairs(builtin_folders) do choices[#choices + 1] = f end
-        for _, f in ipairs(user_folders) do choices[#choices + 1] = f end
-        return choices
+        self:runDetached(_("Fetching folders..."), function(this)
+            return this:fetchUserFolders()
+        end, deliver, function() deliver(nil) end)
     end
 
     -- State for the dialog. Archive and delete exclude each other, so they
@@ -2918,13 +3219,14 @@ function Instapaper:showBulkDownloadDialog()
                         text = _("Folder: ") .. selected_folder.text,
                         callback = function()
                             UIManager:close(bulk_dialog)
-                            local folder_choices = fetchFolderChoices()
-                            local current
-                            for i, c in ipairs(folder_choices) do
-                                if c.value == selected_folder.value then current = i end
-                            end
-                            showPicker(_("Folder"), folder_choices, current,
-                                function(i) selected_folder = folder_choices[i] end)
+                            fetchFolderChoices(function(folder_choices)
+                                local current
+                                for i, c in ipairs(folder_choices) do
+                                    if c.value == selected_folder.value then current = i end
+                                end
+                                showPicker(_("Folder"), folder_choices, current,
+                                    function(i) selected_folder = folder_choices[i] end)
+                            end)
                         end,
                     },
                 },
@@ -3129,43 +3431,52 @@ end
 --------------------------------------------------------------------
 
 function Instapaper:archiveBookmark(bookmark_id, parent_menu, folder_id)
-    local ok, err = self:apiBookmarkAction("archive", bookmark_id)
-    UIManager:show(InfoMessage:new{
-        text = ok and _("Archived.") or T(_("Failed: %1"), err or ""),
-        timeout = 2,
-    })
-    if ok and parent_menu then
-        if parent_menu.refreshList then
-            parent_menu.refreshList()
-        else
-            UIManager:close(parent_menu)
-            self:fetchAndShowArticles(folder_id)
+    self:runDetached(_("Archiving..."), function(this)
+        return this:apiBookmarkAction("archive", bookmark_id)
+    end, function(ok, err)
+        UIManager:show(InfoMessage:new{
+            text = ok and _("Archived.") or T(_("Failed: %1"), err or ""),
+            timeout = 2,
+        })
+        if ok and parent_menu then
+            if parent_menu.refreshList then
+                parent_menu.refreshList()
+            else
+                UIManager:close(parent_menu)
+                self:fetchAndShowArticles(folder_id)
+            end
         end
-    end
+    end)
 end
 
 function Instapaper:deleteBookmark(bookmark_id, parent_menu, folder_id)
-    local ok, err = self:apiBookmarkAction("delete", bookmark_id)
-    UIManager:show(InfoMessage:new{
-        text = ok and _("Deleted.") or T(_("Failed: %1"), err or ""),
-        timeout = 2,
-    })
-    if ok and parent_menu then
-        if parent_menu.refreshList then
-            parent_menu.refreshList()
-        else
-            UIManager:close(parent_menu)
-            self:fetchAndShowArticles(folder_id)
+    self:runDetached(_("Deleting..."), function(this)
+        return this:apiBookmarkAction("delete", bookmark_id)
+    end, function(ok, err)
+        UIManager:show(InfoMessage:new{
+            text = ok and _("Deleted.") or T(_("Failed: %1"), err or ""),
+            timeout = 2,
+        })
+        if ok and parent_menu then
+            if parent_menu.refreshList then
+                parent_menu.refreshList()
+            else
+                UIManager:close(parent_menu)
+                self:fetchAndShowArticles(folder_id)
+            end
         end
-    end
+    end)
 end
 
 function Instapaper:starBookmark(bookmark_id)
-    local ok, err = self:apiBookmarkAction("star", bookmark_id)
-    UIManager:show(InfoMessage:new{
-        text = ok and _("Starred.") or T(_("Failed: %1"), err or ""),
-        timeout = 2,
-    })
+    self:runDetached(_("Starring..."), function(this)
+        return this:apiBookmarkAction("star", bookmark_id)
+    end, function(ok, err)
+        UIManager:show(InfoMessage:new{
+            text = ok and _("Starred.") or T(_("Failed: %1"), err or ""),
+            timeout = 2,
+        })
+    end)
 end
 
 --------------------------------------------------------------------
@@ -3346,47 +3657,19 @@ function Instapaper:addBookmarkFromLink(url, title)
         return
     end
     
-    local NetworkMgr = require("ui/network/manager")
-    
-    -- If network is already online, try to send immediately
-    if NetworkMgr:isOnline() then
-        local ok = self:addBookmark(url, title)
-        if ok then
-            UIManager:show(InfoMessage:new{
-                text = _("Added to Instapaper."),
-                timeout = 2,
-            })
-        else
-            self:addToPendingPool(url, title)
-            UIManager:show(InfoMessage:new{
-                text = _("Failed. Added to pending pool."),
-                timeout = 2,
-            })
-        end
-        return
-    end
-    
-    -- Network is offline
-    if self.auto_connect_network then
-        -- Try to connect and send
+    -- Into the pool first, so the link survives a failed or never-made
+    -- connection; the background sync sends it without blocking the reader
+    -- and reports the result.
+    self:addToPendingPool(url, title)
+    if hasNetwork() then
+        local Notification = require("ui/widget/notification")
+        UIManager:show(Notification:new{ text = _("Sending to Instapaper…") })
+        self:backgroundSync({ pending = true, silent = false })
+    elseif self.auto_connect_network then
         NetworkMgr:runWhenOnline(function()
-            local ok = self:addBookmark(url, title)
-            if ok then
-                UIManager:show(InfoMessage:new{
-                    text = _("Added to Instapaper."),
-                    timeout = 2,
-                })
-            else
-                self:addToPendingPool(url, title)
-                UIManager:show(InfoMessage:new{
-                    text = _("Failed. Added to pending pool."),
-                    timeout = 2,
-                })
-            end
+            self:backgroundSync({ pending = true, silent = false })
         end)
     else
-        -- Auto connect is off, add to pool
-        self:addToPendingPool(url, title)
         UIManager:show(InfoMessage:new{
             text = _("Added to pending pool."),
             timeout = 2,
