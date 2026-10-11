@@ -26,6 +26,7 @@ local base64_encode = require("mime").b64
 local sha2 = require("ffi/sha2")
 local V2 = require("instapaper_v2")
 local ReaderReturn = require("instapaper_reader_return")
+require("instapaper_doccache_guard")
 
 -- Per-run memory, shared by the file manager's and the reader's plugin
 -- instances (main.lua is loaded once per KOReader run):
