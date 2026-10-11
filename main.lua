@@ -38,6 +38,44 @@ local session = {
     progress = {},
 }
 
+-- Background sync (opening a book, Wi-Fi coming up, resume, closing) runs on
+-- the UI thread, so it has to stay cheap. NetworkMgr:isOnline() is a blocking
+-- DNS lookup that takes 5 s whenever DNS is slow; only check that the device
+-- has an address, and only once there is something to send. A request that
+-- cannot reach the server fails on its own and stays queued.
+local function hasNetwork()
+    return NetworkMgr:isConnected() and true or false
+end
+
+-- Background requests give up on a silent server well before the 60 s
+-- default, and a failed one ends the run instead of trying every item.
+local BACKGROUND_BLOCK_TIMEOUT = 5
+local BACKGROUND_TOTAL_TIMEOUT = 10
+local background_depth = 0
+
+local function inBackground(fn)
+    background_depth = background_depth + 1
+    local ok, err = pcall(fn)
+    background_depth = background_depth - 1
+    if not ok then
+        error(err, 0)
+    end
+end
+
+local function isBackground()
+    return background_depth > 0
+end
+
+local function setRequestTimeout()
+    if isBackground() then
+        socketutil:set_timeout(BACKGROUND_BLOCK_TIMEOUT, BACKGROUND_TOTAL_TIMEOUT)
+    else
+        socketutil:set_timeout(
+            socketutil.DEFAULT_BLOCK_TIMEOUT,
+            socketutil.DEFAULT_TOTAL_TIMEOUT)
+    end
+end
+
 -- Display name of a list: built-in names, else the folder name we were given.
 local function folderTitle(folder_id, folder_name)
     local folder_names = {
@@ -156,9 +194,7 @@ function Instapaper:apiRequest(endpoint, body_params, raw_response)
 
     -- Execute request
     local chunks = {}
-    socketutil:set_timeout(
-        socketutil.DEFAULT_BLOCK_TIMEOUT,
-        socketutil.DEFAULT_TOTAL_TIMEOUT)
+    setRequestTimeout()
     local result, code = https.request{
         url     = request_url,
         method  = "POST",
@@ -229,9 +265,7 @@ function Instapaper:apiRequestV2(method, path, query, json_body)
     end
 
     local chunks = {}
-    socketutil:set_timeout(
-        socketutil.DEFAULT_BLOCK_TIMEOUT,
-        socketutil.DEFAULT_TOTAL_TIMEOUT)
+    setRequestTimeout()
     local result, code = https.request{
         url     = request_url,
         method  = method,
@@ -557,15 +591,24 @@ function Instapaper:onReaderReady()
         logger.warn("Instapaper: reader return setup failed", tostring(err))
     end
 
-    if NetworkMgr:isOnline() then
+    if hasNetwork() then
         UIManager:scheduleIn(2, function()
-            if self:countPending() > 0 then
-                self:drainPendingQueue({ silent = true })
-            end
-            self:drainProgressQueue()
-            self:drainFinishedQueue()
+            self:backgroundSync({ pending = true, silent = true })
         end)
     end
+end
+
+-- Sends whatever is queued. Costs nothing when every queue is empty.
+-- opts.pending: also send the pending URL pool; opts.silent: no report for it.
+function Instapaper:backgroundSync(opts)
+    opts = opts or {}
+    inBackground(function()
+        if opts.pending and self:countPending() > 0 then
+            self:drainPendingQueue({ silent = opts.silent })
+        end
+        self:drainProgressQueue()
+        self:drainFinishedQueue()
+    end)
 end
 
 function Instapaper:onNetworkConnected()
@@ -573,12 +616,7 @@ function Instapaper:onNetworkConnected()
         -- If an Instapaper article is currently open, include its current
         -- position in the batch that is about to be sent.
         self:captureCurrentReadingProgress(false)
-
-        if self:countPending() > 0 then
-            self:drainPendingQueue({ silent = false })
-        end
-        self:drainProgressQueue()
-        self:drainFinishedQueue()
+        self:backgroundSync({ pending = true, silent = false })
     end)
 end
 
@@ -586,10 +624,9 @@ function Instapaper:onResume()
     -- A suspend may have queued progress while Wi-Fi was unavailable or while
     -- the device was going to sleep. Retry silently after resume if already
     -- online; this never turns Wi-Fi on by itself.
-    if NetworkMgr:isOnline() then
+    if hasNetwork() then
         UIManager:scheduleIn(1, function()
-            self:drainProgressQueue()
-            self:drainFinishedQueue()
+            self:backgroundSync()
         end)
     end
 end
@@ -718,7 +755,7 @@ function Instapaper:removeQueuedReadingProgress(bookmark_id, timestamp)
 end
 
 function Instapaper:sendReadingProgress(bookmark_id, progress, timestamp)
-    if not self:isLoggedIn() or not NetworkMgr:isOnline() then
+    if not self:isLoggedIn() or not hasNetwork() then
         return false
     end
 
@@ -741,14 +778,12 @@ function Instapaper:sendReadingProgress(bookmark_id, progress, timestamp)
 end
 
 function Instapaper:drainProgressQueue()
-    if self._progress_queue_draining
-            or not self:isLoggedIn()
-            or not NetworkMgr:isOnline() then
+    if self._progress_queue_draining or not self:isLoggedIn() then
         return
     end
 
     local pending = self:getPendingProgress()
-    if next(pending) == nil then
+    if next(pending) == nil or not hasNetwork() then
         return
     end
 
@@ -761,7 +796,7 @@ function Instapaper:drainProgressQueue()
         end
 
         for _, bookmark_id in ipairs(ids) do
-            if not NetworkMgr:isOnline() then
+            if not hasNetwork() then
                 break
             end
 
@@ -957,12 +992,12 @@ function Instapaper:captureCurrentReadingProgress(send_if_online)
         self:queueReadingProgress(bookmark_id, progress, timestamp)
     end
 
-    if send_if_online
-            and self:isLoggedIn()
-            and NetworkMgr:isOnline()
-            and self:sendReadingProgress(
-                bookmark_id, progress, timestamp) then
-        self:removeQueuedReadingProgress(bookmark_id, timestamp)
+    if send_if_online and self:isLoggedIn() and hasNetwork() then
+        inBackground(function()
+            if self:sendReadingProgress(bookmark_id, progress, timestamp) then
+                self:removeQueuedReadingProgress(bookmark_id, timestamp)
+            end
+        end)
     end
 end
 
@@ -1095,9 +1130,9 @@ function Instapaper:queueFinishedCurrentDocument()
     end)
 
     -- Run after the reader has closed: the file cannot be deleted while open.
-    if NetworkMgr:isOnline() then
+    if hasNetwork() then
         UIManager:scheduleIn(1, function()
-            self:drainFinishedQueue()
+            inBackground(function() self:drainFinishedQueue() end)
         end)
     end
 end
@@ -1126,9 +1161,7 @@ function Instapaper:deleteLocalArticle(filepath)
 end
 
 function Instapaper:drainFinishedQueue()
-    if self._finished_queue_draining
-            or not self:isLoggedIn()
-            or not NetworkMgr:isOnline() then
+    if self._finished_queue_draining or not self:isLoggedIn() then
         return
     end
 
@@ -1136,7 +1169,7 @@ function Instapaper:drainFinishedQueue()
     for bookmark_id in pairs(self:getPendingFinished()) do
         ids[#ids + 1] = bookmark_id
     end
-    if #ids == 0 then
+    if #ids == 0 or not hasNetwork() then
         return
     end
 
@@ -1144,12 +1177,13 @@ function Instapaper:drainFinishedQueue()
 
     local ok, err = pcall(function()
         for _, bookmark_id in ipairs(ids) do
-            if not NetworkMgr:isOnline() then
+            if not hasNetwork() then
                 break
             end
 
             local pending = self:getPendingFinished()
             local item = pending[bookmark_id]
+            local failed = false
             if type(item) == "table" then
                 if not item.archived then
                     local call_ok, archived, archive_err = pcall(
@@ -1157,6 +1191,7 @@ function Instapaper:drainFinishedQueue()
                     if call_ok and archived then
                         item.archived = true
                     else
+                        failed = true
                         logger.warn("Instapaper: archive after finishing failed",
                             bookmark_id, tostring(archive_err or archived))
                         item.attempts = (tonumber(item.attempts) or 0) + 1
@@ -1172,6 +1207,9 @@ function Instapaper:drainFinishedQueue()
                     pending[bookmark_id] = nil
                 end
                 self:savePendingFinished(pending)
+            end
+            if failed and isBackground() then
+                break
             end
         end
     end)
@@ -3172,12 +3210,10 @@ function Instapaper:drainPendingQueue(opts)
     if self._draining then return end
     if not self:isLoggedIn() then return end
     
-    local NetworkMgr = require("ui/network/manager")
-    if not NetworkMgr:isOnline() then return end
-    
     local pending = self:getPendingUrls()
-    if #pending == 0 then return end
-    
+    if #pending == 0 or not hasNetwork() then return end
+
+    local background = isBackground()
     self._draining = true
     local Trapper = require("ui/trapper")
     Trapper:wrap(function()
@@ -3196,12 +3232,21 @@ function Instapaper:drainPendingQueue(opts)
                     Trapper:info(T(_("Sending pending URL %1 / %2"),
                         tostring(i), tostring(#pending)))
                 end
-                local ok = self:addBookmark(item.url, item.title)
+                -- Trapper:info yields, so the rest of the loop can run after
+                -- backgroundSync returned: mark each request on its own.
+                local ok
+                if background then
+                    inBackground(function()
+                        ok = self:addBookmark(item.url, item.title)
+                    end)
+                else
+                    ok = self:addBookmark(item.url, item.title)
+                end
                 if ok then
                     success_count = success_count + 1
                 else
                     fail_count = fail_count + 1
-                    if not NetworkMgr:isOnline() then
+                    if background or not hasNetwork() then
                         stopped_for_network = true
                         table.insert(remaining, item)
                     else
