@@ -196,7 +196,7 @@ If you have links waiting in the queue:
 - **Return to list from an article** — ways back to the list an article was opened from (articles opened from the file browser are not affected):
   - **Button position** — Top left, Top right, Bottom left, Bottom right (default; above the status bar), or Off
   - **Show button** — Show the small **Insta** button in that corner. When hidden, tapping the corner still returns to the list
-  - **Ask at end of article** — Replace the end-of-document dialog with one offering **Back to Instapaper list**, **Go to beginning** and **File browser**
+  - **Ask at end of article** — Replace the end-of-document dialog with one offering **Star** (the dialog stays open, so you can star before archiving; when Wi-Fi is off it asks whether to turn it on now or star the article once the device is next online), **Back to Instapaper list**, **Go to beginning** and **File browser**
   - **Back key returns to the list** — On devices with keys, when there is nothing to go back to inside the article
 
   Closing the list you returned to also closes the article and opens the file browser, so the two do not loop.

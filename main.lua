@@ -55,6 +55,8 @@ local BACKGROUND_TOTAL_TIMEOUT = 10
 
 -- Archive attempts for a finished article before it is dropped from the queue.
 local FINISHED_MAX_ATTEMPTS = 5
+-- The same for a star queued from the end-of-article dialog.
+local STAR_MAX_ATTEMPTS = 5
 local background_depth = 0
 
 local function inBackground(fn)
@@ -677,7 +679,7 @@ function Instapaper:backgroundSync(opts)
     if not jobs then
         return
     end
-    if #jobs.urls + #jobs.progress + #jobs.archive == 0 then
+    if #jobs.urls + #jobs.progress + #jobs.star + #jobs.archive == 0 then
         -- Only local work left (deleting archived articles).
         self:applySyncResults({}, opts)
         return
@@ -778,13 +780,14 @@ function Instapaper:syncInForeground(opts)
             self:drainPendingQueue({ silent = opts.silent })
         end
         self:drainProgressQueue()
+        self:drainStarQueue()
         self:drainFinishedQueue()
     end)
 end
 
 -- Snapshot of the queues for the child. nil when there is nothing to do.
 function Instapaper:collectSyncJobs(opts)
-    local jobs = { urls = {}, progress = {}, archive = {} }
+    local jobs = { urls = {}, progress = {}, star = {}, archive = {} }
 
     if opts.pending then
         for _, item in ipairs(self:getPendingUrls()) do
@@ -813,6 +816,10 @@ function Instapaper:collectSyncJobs(opts)
         self:savePendingProgress(pending)
     end
 
+    for bookmark_id in pairs(self:getPendingStarred()) do
+        jobs.star[#jobs.star + 1] = bookmark_id
+    end
+
     local local_work = false
     for bookmark_id, item in pairs(self:getPendingFinished()) do
         if type(item) == "table" then
@@ -824,7 +831,7 @@ function Instapaper:collectSyncJobs(opts)
         end
     end
 
-    if #jobs.urls + #jobs.progress + #jobs.archive == 0 and not local_work then
+    if #jobs.urls + #jobs.progress + #jobs.star + #jobs.archive == 0 and not local_work then
         return nil
     end
     return jobs
@@ -835,7 +842,10 @@ end
 function Instapaper:runSyncJobs(jobs)
     muteChildSettings(self)
 
-    local done = { urls = {}, progress = {}, archived = {}, archive_failed = {} }
+    local done = {
+        urls = {}, progress = {}, starred = {}, star_failed = {},
+        archived = {}, archive_failed = {},
+    }
     for _, item in ipairs(jobs.urls) do
         if not self:addBookmark(item.url, item.title) then
             break
@@ -847,6 +857,15 @@ function Instapaper:runSyncJobs(jobs)
             break
         end
         done.progress[#done.progress + 1] = item
+    end
+    for _, bookmark_id in ipairs(jobs.star or {}) do
+        local call_ok, starred, err = pcall(self.apiBookmarkAction, self, "star", bookmark_id)
+        if not (call_ok and starred) then
+            logger.warn("Instapaper: queued star failed", bookmark_id, tostring(err or starred))
+            done.star_failed[#done.star_failed + 1] = bookmark_id
+            break
+        end
+        done.starred[#done.starred + 1] = bookmark_id
     end
     for _, bookmark_id in ipairs(jobs.archive) do
         local call_ok, archived, err = pcall(self.apiBookmarkAction, self, "archive", bookmark_id)
@@ -869,6 +888,7 @@ function Instapaper:applySyncResults(done, opts)
     for _, item in ipairs(done.progress or {}) do
         self:removeQueuedReadingProgress(item.bookmark_id, tonumber(item.timestamp) or 0)
     end
+    self:applyStarResults(done.starred, done.star_failed)
 
     local archived, failed = {}, {}
     for _, bookmark_id in ipairs(done.archived or {}) do
@@ -2193,6 +2213,7 @@ function Instapaper:logout()
     if self.settings then
         self.settings:saveSetting("pending_progress", {})
         self.settings:saveSetting("pending_finished", {})
+        self.settings:saveSetting("pending_starred", {})
         self.settings:delSetting("bulk_folders")
         self.settings:delSetting("bulk_last_folder")
         self.settings:delSetting("last_list_folder")
@@ -3477,6 +3498,113 @@ function Instapaper:starBookmark(bookmark_id)
             timeout = 2,
         })
     end)
+end
+
+--------------------------------------------------------------------
+-- Stars waiting for a connection
+--------------------------------------------------------------------
+
+-- Keyed by bookmark_id, account-scoped like pending_finished. Sent by
+-- backgroundSync before the archive queue.
+
+function Instapaper:getPendingStarred()
+    local pending = self.settings and self.settings:readSetting("pending_starred")
+    return type(pending) == "table" and pending or {}
+end
+
+function Instapaper:savePendingStarred(pending)
+    if not self.settings then
+        return
+    end
+    self.settings:saveSetting("pending_starred", pending or {})
+    self.settings:flush()
+end
+
+function Instapaper:queueStar(bookmark_id)
+    local pending = self:getPendingStarred()
+    pending[bookmark_id] = pending[bookmark_id] or { attempts = 0 }
+    self:savePendingStarred(pending)
+end
+
+-- Takes what went through off the queue; a star that keeps failing is dropped.
+function Instapaper:applyStarResults(starred, failed)
+    if #(starred or {}) + #(failed or {}) == 0 then
+        return
+    end
+    local pending = self:getPendingStarred()
+    for _, bookmark_id in ipairs(starred or {}) do
+        pending[tostring(bookmark_id)] = nil
+    end
+    for _, bookmark_id in ipairs(failed or {}) do
+        local item = pending[tostring(bookmark_id)]
+        if type(item) == "table" then
+            item.attempts = (tonumber(item.attempts) or 0) + 1
+            if item.attempts >= STAR_MAX_ATTEMPTS then
+                pending[tostring(bookmark_id)] = nil
+            end
+        end
+    end
+    self:savePendingStarred(pending)
+end
+
+-- The old way, for when fork is unavailable (see syncInForeground).
+function Instapaper:drainStarQueue()
+    if not self:isLoggedIn() or not hasNetwork() then
+        return
+    end
+    local starred, failed = {}, {}
+    for bookmark_id in pairs(self:getPendingStarred()) do
+        local call_ok, ok, err = pcall(self.apiBookmarkAction, self, "star", bookmark_id)
+        if not (call_ok and ok) then
+            logger.warn("Instapaper: queued star failed", bookmark_id, tostring(err or ok))
+            failed[#failed + 1] = bookmark_id
+            break
+        end
+        starred[#starred + 1] = bookmark_id
+    end
+    self:applyStarResults(starred, failed)
+end
+
+-- Star from the end-of-article dialog. Offline, ask whether to turn Wi-Fi on
+-- now or star once the device is next online; a request that fails is queued
+-- too. on_done(state) gets "starred" or "queued".
+function Instapaper:starFromReader(bookmark_id, on_done)
+    local Notification = require("ui/widget/notification")
+    local function queue()
+        self:queueStar(bookmark_id)
+        UIManager:show(Notification:new{
+            text = _("The article will be starred when the device is online."),
+        })
+        on_done("queued")
+    end
+    local function starNow()
+        self:runDetached(_("Starring..."), function(this)
+            return this:apiBookmarkAction("star", bookmark_id)
+        end, function(ok, err)
+            if ok then
+                UIManager:show(Notification:new{ text = _("Starred.") })
+                on_done("starred")
+            else
+                logger.warn("Instapaper: star failed, queued", bookmark_id, tostring(err))
+                queue()
+            end
+        end)
+    end
+
+    if hasNetwork() then
+        starNow()
+        return
+    end
+    local MultiConfirmBox = require("ui/widget/multiconfirmbox")
+    UIManager:show(MultiConfirmBox:new{
+        text = _("Wi-Fi is off.\nTurn it on and star the article now, or star it when the device is next online?"),
+        choice1_text = _("Turn on Wi-Fi"),
+        choice1_callback = function()
+            NetworkMgr:turnOnWifiAndWaitForConnection(starNow)
+        end,
+        choice2_text = _("When online"),
+        choice2_callback = queue,
+    })
 end
 
 --------------------------------------------------------------------

@@ -409,44 +409,66 @@ end
 
 function ReaderReturn.showEndOfArticleDialog(plugin)
     local dialog
+    local buttons = {}
+    -- "When finished: Archive" takes the article off the reading list, so
+    -- this is the last easy place to star it. The dialog stays open; offline,
+    -- the star can wait for the next connection.
+    local bookmark_id = type(plugin.getCurrentInstapaperBookmarkId) == "function"
+        and plugin:getCurrentInstapaperBookmarkId()
+    if bookmark_id and plugin:isLoggedIn() then
+        buttons[#buttons + 1] = {{
+            id = "star",
+            text = _("Star"),
+            callback = function()
+                plugin:starFromReader(bookmark_id, function(state)
+                    local button = dialog:getButtonById("star")
+                    if button and UIManager:isWidgetShown(dialog) then
+                        button:setText(state == "queued" and _("Star queued") or _("Starred"),
+                            button.width)
+                        button:disable()
+                        UIManager:setDirty(dialog, "ui")
+                    end
+                end)
+            end,
+        }}
+    end
+    buttons[#buttons + 1] = {{
+        text = _("Back to Instapaper list"),
+        callback = function()
+            UIManager:close(dialog)
+            ReaderReturn.returnToList(plugin)
+        end,
+    }}
+    buttons[#buttons + 1] = {
+        {
+            text = _("Go to beginning"),
+            callback = function()
+                UIManager:close(dialog)
+                if plugin.ui and plugin.ui.gotopage then
+                    plugin.ui.gotopage:onGoToBeginning()
+                end
+            end,
+        },
+        {
+            text = _("File browser"),
+            callback = function()
+                UIManager:close(dialog)
+                local ui = plugin.ui
+                local file = ui and ui.document and ui.document.file
+                -- Delayed, like ReaderStatus does, so as not to tear
+                -- down the instance we are running inside of.
+                UIManager:nextTick(function()
+                    ui:onClose()
+                    ui:showFileManager(file)
+                end)
+            end,
+        },
+    }
     dialog = ButtonDialog:new{
         name = "instapaper_end_of_article",
         title = _("You've reached the end of the article.\nWhat would you like to do?"),
         title_align = "center",
-        buttons = {
-            {{
-                text = _("Back to Instapaper list"),
-                callback = function()
-                    UIManager:close(dialog)
-                    ReaderReturn.returnToList(plugin)
-                end,
-            }},
-            {
-                {
-                    text = _("Go to beginning"),
-                    callback = function()
-                        UIManager:close(dialog)
-                        if plugin.ui and plugin.ui.gotopage then
-                            plugin.ui.gotopage:onGoToBeginning()
-                        end
-                    end,
-                },
-                {
-                    text = _("File browser"),
-                    callback = function()
-                        UIManager:close(dialog)
-                        local ui = plugin.ui
-                        local file = ui and ui.document and ui.document.file
-                        -- Delayed, like ReaderStatus does, so as not to tear
-                        -- down the instance we are running inside of.
-                        UIManager:nextTick(function()
-                            ui:onClose()
-                            ui:showFileManager(file)
-                        end)
-                    end,
-                },
-            },
-        },
+        buttons = buttons,
     }
     UIManager:show(dialog)
 end
