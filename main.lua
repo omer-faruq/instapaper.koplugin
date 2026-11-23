@@ -2603,7 +2603,10 @@ function Instapaper:showArticleMenu(bookmarks, folder_id, folder_name, paging, i
     end
 
     local function buildSubtitle()
-        return self:unreadTagFilter(folder_id) and unreadTagFilterLabel() or ""
+        if self:canFilterUnread(folder_id) then
+            return unreadTagFilterLabel()
+        end
+        return ""
     end
 
     local menu
