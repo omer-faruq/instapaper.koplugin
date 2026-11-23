@@ -119,7 +119,7 @@ to API v1 and asks you to try again. You can also switch by hand under
 
 From the Instapaper menu, choose:
 - **Unread articles** — Your reading list
-  - **Unread tag filter (API v2)** — Open **Unread articles** and select **Unread tag filter** at the top of the list. Choose **Hide a tag** or **Show only a tag**, then select a tag from your Instapaper account. Select **Turn off** to see all unread articles.
+  - **Unread tag filter (API v2)** — Open **Unread articles** and tap the menu button beside the section title. Choose **Hide a tag** or **Show only a tag**, then select a tag from your Instapaper account. Select **Turn off** to see all unread articles. Use **Refresh** in the same menu to reload the list.
 - **Starred articles** — Articles you've starred
 - **Archived articles** — Completed articles
 - **Custom folders** — Lists your user-created Instapaper folders; tap one to browse its articles

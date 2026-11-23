@@ -1976,7 +1976,7 @@ function Instapaper:getSettingsMenuItems()
     }
 end
 
-function Instapaper:showUnreadTagActions(on_select)
+function Instapaper:showUnreadTagActions(on_select, on_refresh)
     local dialog
     local function choose(mode)
         UIManager:close(dialog)
@@ -1996,6 +1996,13 @@ function Instapaper:showUnreadTagActions(on_select)
                     callback = function()
                         UIManager:close(dialog)
                         on_select("", session.unread_tag_mode)
+                    end,
+                },
+                {
+                    text = _("Refresh"),
+                    callback = function()
+                        UIManager:close(dialog)
+                        on_refresh()
                     end,
                 },
                 {
@@ -2595,15 +2602,16 @@ function Instapaper:showArticleMenu(bookmarks, folder_id, folder_name, paging, i
         return title
     end
 
+    local function buildSubtitle()
+        return self:unreadTagFilter(folder_id) and unreadTagFilterLabel() or ""
+    end
+
     local menu
 
     local function buildItems()
         local menu_items = {}
-        if self:canFilterUnread(folder_id) then
-            menu_items[1] = { text = unreadTagFilterLabel(), bold = true, _tag_filter = true }
-            if #bookmarks == 0 and not hasMore() then
-                menu_items[2] = { text = _("No articles found."), dim = true, select_enabled = false }
-            end
+        if self:canFilterUnread(folder_id) and #bookmarks == 0 and not hasMore() then
+            menu_items[1] = { text = _("No articles found."), dim = true, select_enabled = false }
         end
         for _, bm in ipairs(bookmarks) do
             local title = bm.title
@@ -2669,8 +2677,7 @@ function Instapaper:showArticleMenu(bookmarks, folder_id, folder_name, paging, i
         for _, bm in ipairs(bookmarks) do
             seen[tostring(bm.bookmark_id)] = true
         end
-        local filter_rows = self:canFilterUnread(folder_id) and 1 or 0
-        local first_new = #bookmarks + filter_rows + 1
+        local first_new = #bookmarks + 1
         for _, bm in ipairs(page) do
             if not seen[tostring(bm.bookmark_id)] then
                 bookmarks[#bookmarks + 1] = bm
@@ -2680,7 +2687,7 @@ function Instapaper:showArticleMenu(bookmarks, folder_id, folder_name, paging, i
         paging.total = total or paging.total
         paging.last_page_count = last_page_count
         -- Keep the reader on the first new article.
-        menu:switchItemTable(buildTitle(), buildItems(), math.min(first_new, math.max(1, #bookmarks + filter_rows)))
+        menu:switchItemTable(buildTitle(), buildItems(), math.min(first_new, math.max(1, #bookmarks)), nil, buildSubtitle())
         -- A whole-screen change through a partial refresh can leave half of
         -- the old page on e-ink; flash it clean.
         UIManager:setDirty(nil, "full")
@@ -2732,7 +2739,7 @@ function Instapaper:showArticleMenu(bookmarks, folder_id, folder_name, paging, i
         if reset_page or (not silent and new_count > 0) then
             keep = 1
         end
-        menu:switchItemTable(buildTitle(), items, keep)
+        menu:switchItemTable(buildTitle(), items, keep, nil, buildSubtitle())
         UIManager:setDirty(nil, "full")
         remember(firstItemOnPage())
 
@@ -2776,15 +2783,25 @@ function Instapaper:showArticleMenu(bookmarks, folder_id, folder_name, paging, i
         end)
     end
 
+    local function refreshFromHeader()
+        NetworkMgr:runWhenOnline(function() refresh(false) end)
+    end
+
+    local can_filter = self:canFilterUnread(folder_id)
     menu = Menu:new{
         title = buildTitle(),
+        subtitle = buildSubtitle(),
         item_table = buildItems(),
         is_borderless = true,
         is_popout = false,
         title_bar_fm_style = true,
-        title_bar_left_icon = "cre.render.reload",
+        title_bar_left_icon = can_filter and "appbar.menu" or "cre.render.reload",
         onLeftButtonTap = function()
-            NetworkMgr:runWhenOnline(function() refresh(false) end)
+            if can_filter then
+                self:showUnreadTagActions(applyTagFilter, refreshFromHeader)
+            else
+                refreshFromHeader()
+            end
             return true
         end,
         close_callback = function()
@@ -2799,10 +2816,6 @@ function Instapaper:showArticleMenu(bookmarks, folder_id, folder_name, paging, i
         onMenuSelect = function(menu_self, item)
             if item and item._load_more then
                 NetworkMgr:runWhenOnline(loadMore)
-                return true
-            end
-            if item and item._tag_filter then
-                self:showUnreadTagActions(applyTagFilter)
                 return true
             end
             -- An article was picked: the list stays up while it downloads,
