@@ -78,9 +78,22 @@ function V2.normalizeBookmark(b)
     }
 end
 
+local function hasTag(bookmark, name)
+    if type(bookmark.tags) ~= "table" then return false end
+    for _, tag in ipairs(bookmark.tags) do
+        if type(tag) == "table" and str(tag.name) and tag.name:lower() == name then
+            return true
+        end
+    end
+    return false
+end
+
 -- Decoded GET /bookmarks response -> list of normalized bookmarks, plus the
 -- raw count of entries on the page (bookmarks + deleted ids) for paging.
-function V2.parseBookmarkList(data)
+function V2.parseBookmarkList(data, tag, tag_mode)
+    tag = str(tag)
+    tag = tag and tag:lower()
+    local show_only = tag_mode == "show_only"
     local bookmarks = {}
     local page_count = 0
     if type(data) ~= "table" then return bookmarks, page_count end
@@ -88,7 +101,9 @@ function V2.parseBookmarkList(data)
         for _, item in ipairs(data.bookmarks) do
             page_count = page_count + 1
             local bm = V2.normalizeBookmark(item)
-            if bm then bookmarks[#bookmarks + 1] = bm end
+            if bm and (not tag or hasTag(item, tag) == show_only) then
+                bookmarks[#bookmarks + 1] = bm
+            end
         end
     end
     if type(data.deleted_ids) == "table" then

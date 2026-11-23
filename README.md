@@ -179,6 +179,7 @@ If you have links waiting in the queue:
 
 **Settings** in the Instapaper menu opens a submenu. Each row shows its current value, and changes are saved immediately:
 
+- **Unread tag filter (API v2)** — Choose **Hide a tag** or **Show only a tag**, then select a tag from your Instapaper account. Select **Turn off** to see all unread articles.
 - **Article list limit (API v1)** — Number of articles fetched per request: 10, 25, 50, 100, 200, or 500 (default: 50). Disabled with API v2, where lists load 50 at a time with **Load more…**
 - **Output format** — Save articles as **HTML** (default) or **EPUB**
 - **Include images (EPUB)** — When EPUB format is selected, optionally download and embed article images into the EPUB file (ON/OFF)
