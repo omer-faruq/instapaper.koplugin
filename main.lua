@@ -2602,13 +2602,6 @@ function Instapaper:showArticleMenu(bookmarks, folder_id, folder_name, paging, i
         return title
     end
 
-    local function buildSubtitle()
-        if self:canFilterUnread(folder_id) then
-            return unreadTagFilterLabel()
-        end
-        return ""
-    end
-
     local menu
 
     local function buildItems()
@@ -2690,7 +2683,7 @@ function Instapaper:showArticleMenu(bookmarks, folder_id, folder_name, paging, i
         paging.total = total or paging.total
         paging.last_page_count = last_page_count
         -- Keep the reader on the first new article.
-        menu:switchItemTable(buildTitle(), buildItems(), math.min(first_new, math.max(1, #bookmarks)), nil, buildSubtitle())
+        menu:switchItemTable(buildTitle(), buildItems(), math.min(first_new, math.max(1, #bookmarks)))
         -- A whole-screen change through a partial refresh can leave half of
         -- the old page on e-ink; flash it clean.
         UIManager:setDirty(nil, "full")
@@ -2742,7 +2735,7 @@ function Instapaper:showArticleMenu(bookmarks, folder_id, folder_name, paging, i
         if reset_page or (not silent and new_count > 0) then
             keep = 1
         end
-        menu:switchItemTable(buildTitle(), items, keep, nil, buildSubtitle())
+        menu:switchItemTable(buildTitle(), items, keep)
         UIManager:setDirty(nil, "full")
         remember(firstItemOnPage())
 
@@ -2793,7 +2786,6 @@ function Instapaper:showArticleMenu(bookmarks, folder_id, folder_name, paging, i
     local can_filter = self:canFilterUnread(folder_id)
     menu = Menu:new{
         title = buildTitle(),
-        subtitle = buildSubtitle(),
         item_table = buildItems(),
         is_borderless = true,
         is_popout = false,
@@ -2837,6 +2829,16 @@ function Instapaper:showArticleMenu(bookmarks, folder_id, folder_name, paging, i
             return true
         end,
     }
+    if can_filter and self.path then
+        local icon_path = self.path .. "/icons/Filter Cog Icons.svg"
+        local button = menu.title_bar and menu.title_bar.left_button
+        if button and button.image and lfs.attributes(icon_path, "mode") == "file" then
+            -- KOReader looks up named icons in its own icon directories.
+            button.image:free()
+            button.image.file = icon_path
+            button:update()
+        end
+    end
     -- Archive/Delete from the long-press dialog reload the list through this.
     menu.refreshList = function()
         NetworkMgr:runWhenOnline(function() refresh(true) end)
