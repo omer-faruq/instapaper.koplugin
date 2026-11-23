@@ -33,6 +33,7 @@ require("instapaper_doccache_guard")
 --   last_list: the last article list shown, for "Continue"
 --   finished:  bookmark ids queued by "When finished" in this run
 --   progress:  reading progress made on this device, by bookmark id
+--   unread_tag and unread_tag_mode: shared by the file manager and reader
 local session = {
     last_list = nil,
     finished = {},
@@ -353,7 +354,7 @@ end
 -- "starred", "archive" or a folder id. Returns ok, bookmarks|error, page_count,
 -- total (v2 only, may be nil).
 -- v1 has no offset: it always returns the first page.
-function Instapaper:apiListBookmarks(folder_id, limit, offset)
+function Instapaper:apiListBookmarks(folder_id, limit, offset, tag, tag_mode)
     if self:usesV2() then
         local query = V2.listParams(folder_id)
         query.limit = tostring(limit)
@@ -364,7 +365,7 @@ function Instapaper:apiListBookmarks(folder_id, limit, offset)
         if not ok then
             return false, httpError(code, err)
         end
-        local bookmarks, page_count, total = V2.parseBookmarkList(data)
+        local bookmarks, page_count, total = V2.parseBookmarkList(data, tag, tag_mode)
         return true, bookmarks, page_count, total
     end
 
@@ -1009,6 +1010,11 @@ function Instapaper:loadSettings()
     self.api_version        = self.settings:readSetting("api_version") or "v2"
     self.v2_confirmed       = self.settings:readSetting("v2_confirmed") or false
     self.article_limit      = self.settings:readSetting("article_limit") or 50
+    if session.unread_tag == nil then
+        session.unread_tag = self.settings:readSetting("unread_tag")
+            or self.settings:readSetting("unread_excluded_tag") or ""
+        session.unread_tag_mode = self.settings:readSetting("unread_tag_mode") or "hide"
+    end
     self.output_format      = self.settings:readSetting("output_format") or "html"
     self.include_images     = self.settings:readSetting("include_images") or false
     -- Designed EPUB cover (title + lead image + author): on unless turned off.
@@ -1032,6 +1038,8 @@ function Instapaper:saveSettings()
     self.settings:saveSetting("api_version",        self.api_version)
     self.settings:saveSetting("v2_confirmed",       self.v2_confirmed)
     self.settings:saveSetting("article_limit",      self.article_limit)
+    self.settings:saveSetting("unread_tag", session.unread_tag)
+    self.settings:saveSetting("unread_tag_mode", session.unread_tag_mode)
     self.settings:saveSetting("output_format",      self.output_format)
     self.settings:saveSetting("include_images",     self.include_images)
     self.settings:saveSetting("designed_cover",     self.designed_cover)
@@ -1772,6 +1780,16 @@ function Instapaper:showCredentialsDialog()
     self.cred_dialog:onShowKeyboard()
 end
 
+local function unreadTagFilterLabel()
+    local tag = session.unread_tag
+    if tag == "" then
+        return _("Unread tag filter (Off)")
+    elseif session.unread_tag_mode == "show_only" then
+        return T(_("Unread tag filter (Show only %1)"), tag)
+    end
+    return T(_("Unread tag filter (Hide %1)"), tag)
+end
+
 -- Settings as a native submenu: each row shows its current value, choices
 -- open as radio lists, and every change is saved at once.
 function Instapaper:getSettingsMenuItems()
@@ -1828,6 +1846,40 @@ function Instapaper:getSettingsMenuItems()
             item.enabled_func = function() return not self:usesV2() end
             return item
         end)(),
+        {
+            text_func = unreadTagFilterLabel,
+            enabled_func = function() return self:usesV2() end,
+            sub_item_table = {
+                {
+                    text = _("Hide a tag"),
+                    keep_menu_open = true,
+                    callback = function(touchmenu_instance)
+                        self:chooseUnreadTag("hide", function(tag, mode)
+                            self:setUnreadTagFilter(tag, mode)
+                            touchmenu_instance:updateItems()
+                        end)
+                    end,
+                },
+                {
+                    text = _("Show only a tag"),
+                    keep_menu_open = true,
+                    callback = function(touchmenu_instance)
+                        self:chooseUnreadTag("show_only", function(tag, mode)
+                            self:setUnreadTagFilter(tag, mode)
+                            touchmenu_instance:updateItems()
+                        end)
+                    end,
+                },
+                {
+                    text = _("Turn off"),
+                    keep_menu_open = true,
+                    callback = function(touchmenu_instance)
+                        self:setUnreadTagFilter("", session.unread_tag_mode)
+                        touchmenu_instance:updateItems()
+                    end,
+                },
+            },
+        },
         choiceItem(_("Output format"), "output_format", "html", {
             { "HTML", "html" },
             { "EPUB", "epub" },
@@ -1922,6 +1974,117 @@ function Instapaper:getSettingsMenuItems()
             },
         },
     }
+end
+
+function Instapaper:showUnreadTagActions(on_select, on_refresh)
+    local dialog
+    local function choose(mode)
+        UIManager:close(dialog)
+        self:chooseUnreadTag(mode, on_select)
+    end
+    dialog = ButtonDialog:new{
+        title = unreadTagFilterLabel(),
+        buttons = {
+            {
+                { text = _("Hide a tag"), callback = function() choose("hide") end },
+                { text = _("Show only a tag"), callback = function() choose("show_only") end },
+            },
+            {
+                {
+                    text = _("Turn off"),
+                    enabled = session.unread_tag ~= "",
+                    callback = function()
+                        UIManager:close(dialog)
+                        on_select("", session.unread_tag_mode)
+                    end,
+                },
+                {
+                    text = _("Refresh"),
+                    callback = function()
+                        UIManager:close(dialog)
+                        on_refresh()
+                    end,
+                },
+                {
+                    text = _("Cancel"),
+                    id = "close",
+                    callback = function() UIManager:close(dialog) end,
+                },
+            },
+        },
+    }
+    UIManager:show(dialog)
+end
+
+function Instapaper:setUnreadTagFilter(tag, mode)
+    if tag == session.unread_tag and mode == session.unread_tag_mode then
+        return
+    end
+    session.unread_tag = tag
+    session.unread_tag_mode = mode
+    self:saveSettings()
+    if session.last_list and session.last_list.folder_id == "unread" then
+        session.last_list = nil
+    end
+end
+
+function Instapaper:chooseUnreadTag(mode, on_select)
+    self:ensureOnlineAndLoggedIn(function()
+        self:runDetached(_("Fetching tags..."), function(this)
+            local ok, data, code, err = this:apiRequestV2("GET", "/tags")
+            if not ok then
+                return false, httpError(code, err)
+            end
+            if type(data) ~= "table" or type(data.tags) ~= "table" then
+                return false, _("Failed to parse tag list.")
+            end
+            return true, data.tags
+        end, function(ok, tags)
+            if not ok then
+                UIManager:show(InfoMessage:new{
+                    text = T(_("Failed to fetch tags: %1"), tags),
+                })
+                return
+            end
+            self:showUnreadTagPicker(tags, mode, on_select)
+        end)
+    end)
+end
+
+function Instapaper:showUnreadTagPicker(tags, mode, on_select)
+    local names = {}
+    for _, tag in ipairs(tags) do
+        if type(tag) == "table" and V2.str(tag.name) then
+            names[#names + 1] = tag.name
+        end
+    end
+    if #names == 0 then
+        UIManager:show(InfoMessage:new{ text = _("No Instapaper tags found.") })
+        return
+    end
+    table.sort(names, function(a, b) return a:lower() < b:lower() end)
+
+    local picker
+    local items = {}
+    for _, name in ipairs(names) do
+        items[#items + 1] = {
+            text = name,
+            callback = function()
+                UIManager:close(picker)
+                on_select(name, mode)
+            end,
+        }
+    end
+    picker = Menu:new{
+        title = mode == "show_only" and _("Show only articles with this tag")
+            or _("Hide articles with this tag"),
+        item_table = items,
+        is_borderless = true,
+        is_popout = false,
+        title_bar_fm_style = true,
+        close_callback = function() UIManager:close(picker) end,
+    }
+    UIManager:show(picker, "full")
 end
 
 function Instapaper:showCacheFolderDialog(return_callback, current_folder)
@@ -2240,12 +2403,45 @@ local V2_LIST_MAX_PAGE_SIZE = 500
 -- "Continue" offers the last list for this long after it was last used.
 local LAST_LIST_TTL = 3600
 
+function Instapaper:canFilterUnread(folder_id)
+    return folder_id == "unread" and self:usesV2()
+end
+
+function Instapaper:unreadTagFilter(folder_id)
+    if self:canFilterUnread(folder_id) and session.unread_tag ~= "" then
+        return session.unread_tag, session.unread_tag_mode
+    end
+end
+
+-- Skip pages containing only hidden articles while keeping server offsets.
+function Instapaper:fetchArticlePage(folder_id, limit, offset, filter)
+    offset = offset or 0
+    local tag, tag_mode = self:unreadTagFilter(folder_id)
+    if filter then
+        tag = V2.str(filter.tag)
+        tag_mode = filter.mode
+    end
+    local consumed = 0
+    while true do
+        local ok, bookmarks, count, total = self:apiListBookmarks(folder_id, limit, offset + consumed, tag, tag_mode)
+        if not ok then
+            return false, bookmarks
+        end
+        consumed = consumed + count
+        local more = count > 0 and ((total and offset + consumed < total)
+            or (not total and count >= limit))
+        if not tag or #bookmarks > 0 or not more then
+            return true, bookmarks, consumed, total, count
+        end
+    end
+end
+
 -- loading_text: shown instead of "Fetching articles..." while loading.
 function Instapaper:fetchAndShowArticles(folder_id, folder_name, loading_text)
     local page_size = self:usesV2() and V2_LIST_PAGE_SIZE or (self.article_limit or 50)
     self:runDetached(loading_text or _("Fetching articles..."), function(this)
-        return this:apiListBookmarks(folder_id, page_size)
-    end, function(ok, bookmarks, page_count, total)
+        return this:fetchArticlePage(folder_id, page_size)
+    end, function(ok, bookmarks, page_count, total, last_page_count)
         if not ok then
             UIManager:show(InfoMessage:new{
                 text = T(_("Failed to fetch articles: %1"), bookmarks),
@@ -2253,7 +2449,7 @@ function Instapaper:fetchAndShowArticles(folder_id, folder_name, loading_text)
             return
         end
 
-        if #bookmarks == 0 then
+        if #bookmarks == 0 and not self:canFilterUnread(folder_id) then
             UIManager:show(InfoMessage:new{
                 text = _("No articles found."),
             })
@@ -2264,7 +2460,7 @@ function Instapaper:fetchAndShowArticles(folder_id, folder_name, loading_text)
             offset = page_count,
             total = total,
             page_size = page_size,
-            last_page_count = page_count,
+            last_page_count = last_page_count,
         })
     end)
 end
@@ -2324,14 +2520,14 @@ function Instapaper:continueLastList(opts)
         end
     end
 
-    if #bookmarks == 0 then
+    if #bookmarks == 0 and not self:canFilterUnread(last.folder_id) then
         self:ensureOnlineAndLoggedIn(function()
             self:fetchAndShowArticles(last.folder_id, last.folder_name)
         end)
         return
     end
     self:showArticleMenu(bookmarks, last.folder_id, last.folder_name, paging,
-        math.min(last.itemnumber, #bookmarks), opts.on_leave)
+        last.itemnumber, opts.on_leave)
 end
 
 -- From an article opened from a list (button, corner tap, end-of-article
@@ -2393,14 +2589,14 @@ function Instapaper:showArticleMenu(bookmarks, folder_id, folder_name, paging, i
             return false
         end
         if paging.total then
-            return paging.offset < paging.total
+            return paging.last_page_count > 0 and paging.offset < paging.total
         end
         return paging.last_page_count >= paging.page_size
     end
 
     local function buildTitle()
         local title = "Instapaper - " .. menu_title
-        if paging.total and paging.total > #bookmarks then
+        if not self:unreadTagFilter(folder_id) and paging.total and paging.total > #bookmarks then
             title = title .. " (" .. #bookmarks .. "/" .. paging.total .. ")"
         end
         return title
@@ -2410,6 +2606,9 @@ function Instapaper:showArticleMenu(bookmarks, folder_id, folder_name, paging, i
 
     local function buildItems()
         local menu_items = {}
+        if self:canFilterUnread(folder_id) and #bookmarks == 0 and not hasMore() then
+            menu_items[1] = { text = _("No articles found."), dim = true, select_enabled = false }
+        end
         for _, bm in ipairs(bookmarks) do
             local title = bm.title
             if not title or title == "" or type(title) ~= "string" then
@@ -2462,7 +2661,7 @@ function Instapaper:showArticleMenu(bookmarks, folder_id, folder_name, paging, i
         state.time = os.time()
     end
 
-    local function applyMore(ok, page, page_count, total)
+    local function applyMore(ok, page, page_count, total, last_page_count)
         if not ok then
             UIManager:show(InfoMessage:new{
                 text = T(_("Failed to fetch articles: %1"), page),
@@ -2482,9 +2681,9 @@ function Instapaper:showArticleMenu(bookmarks, folder_id, folder_name, paging, i
         end
         paging.offset = paging.offset + page_count
         paging.total = total or paging.total
-        paging.last_page_count = page_count
+        paging.last_page_count = last_page_count
         -- Keep the reader on the first new article.
-        menu:switchItemTable(buildTitle(), buildItems(), first_new)
+        menu:switchItemTable(buildTitle(), buildItems(), math.min(first_new, math.max(1, #bookmarks)))
         -- A whole-screen change through a partial refresh can leave half of
         -- the old page on e-ink; flash it clean.
         UIManager:setDirty(nil, "full")
@@ -2493,7 +2692,7 @@ function Instapaper:showArticleMenu(bookmarks, folder_id, folder_name, paging, i
 
     local function loadMore()
         self:runDetached(_("Fetching articles..."), function(this)
-            return this:apiListBookmarks(folder_id, paging.page_size, paging.offset)
+            return this:fetchArticlePage(folder_id, paging.page_size, paging.offset)
         end, applyMore)
     end
 
@@ -2501,7 +2700,7 @@ function Instapaper:showArticleMenu(bookmarks, folder_id, folder_name, paging, i
     -- articles arrive at the top, so jump there when there are any; otherwise
     -- stay on the same page and say so. silent: the reload after Archive or
     -- Delete, which only has to stay put.
-    local function applyRefresh(silent, ok, page, page_count, total)
+    local function applyRefresh(silent, reset_page, ok, page, page_count, total, last_page_count)
         if not ok then
             UIManager:show(InfoMessage:new{
                 text = T(_("Failed to fetch articles: %1"), page),
@@ -2529,13 +2728,14 @@ function Instapaper:showArticleMenu(bookmarks, folder_id, folder_name, paging, i
         end
         paging.offset = page_count
         paging.total = total
-        paging.last_page_count = page_count
+        paging.last_page_count = last_page_count
 
-        local keep = math.min(firstItemOnPage(), math.max(#bookmarks, 1))
-        if not silent and new_count > 0 then
+        local items = buildItems()
+        local keep = math.min(firstItemOnPage(), math.max(#items, 1))
+        if reset_page or (not silent and new_count > 0) then
             keep = 1
         end
-        menu:switchItemTable(buildTitle(), buildItems(), keep)
+        menu:switchItemTable(buildTitle(), items, keep)
         UIManager:setDirty(nil, "full")
         remember(firstItemOnPage())
 
@@ -2556,21 +2756,47 @@ function Instapaper:showArticleMenu(bookmarks, folder_id, folder_name, paging, i
                 V2_LIST_MAX_PAGE_SIZE)
         end
         self:runDetached(_("Fetching articles..."), function(this)
-            return this:apiListBookmarks(folder_id, limit)
+            return this:fetchArticlePage(folder_id, limit)
         end, function(...)
-            applyRefresh(silent, ...)
+            applyRefresh(silent, false, ...)
         end)
     end
 
+    local function applyTagFilter(tag, mode)
+        if tag == session.unread_tag and mode == session.unread_tag_mode then
+            return
+        end
+        NetworkMgr:runWhenOnline(function()
+            self:runDetached(_("Fetching articles..."), function(this)
+                return this:fetchArticlePage(folder_id, paging.page_size, 0, { tag = tag, mode = mode })
+            end, function(ok, ...)
+                if ok then
+                    self:setUnreadTagFilter(tag, mode)
+                    session.last_list = state
+                end
+                applyRefresh(true, true, ok, ...)
+            end)
+        end)
+    end
+
+    local function refreshFromHeader()
+        NetworkMgr:runWhenOnline(function() refresh(false) end)
+    end
+
+    local can_filter = self:canFilterUnread(folder_id)
     menu = Menu:new{
         title = buildTitle(),
         item_table = buildItems(),
         is_borderless = true,
         is_popout = false,
         title_bar_fm_style = true,
-        title_bar_left_icon = "cre.render.reload",
+        title_bar_left_icon = can_filter and "appbar.menu" or "cre.render.reload",
         onLeftButtonTap = function()
-            NetworkMgr:runWhenOnline(function() refresh(false) end)
+            if can_filter then
+                self:showUnreadTagActions(applyTagFilter, refreshFromHeader)
+            else
+                refreshFromHeader()
+            end
             return true
         end,
         close_callback = function()
@@ -2603,13 +2829,23 @@ function Instapaper:showArticleMenu(bookmarks, folder_id, folder_name, paging, i
             return true
         end,
     }
+    if can_filter and self.path then
+        local icon_path = self.path .. "/icons/Filter Cog Icons.svg"
+        local button = menu.title_bar and menu.title_bar.left_button
+        if button and button.image and lfs.attributes(icon_path, "mode") == "file" then
+            -- KOReader looks up named icons in its own icon directories.
+            button.image:free()
+            button.image.file = icon_path
+            button:update()
+        end
+    end
     -- Archive/Delete from the long-press dialog reload the list through this.
     menu.refreshList = function()
         NetworkMgr:runWhenOnline(function() refresh(true) end)
     end
 
     if itemnumber and itemnumber > 1 then
-        menu:switchItemTable(nil, menu.item_table, itemnumber)
+        menu:switchItemTable(nil, menu.item_table, math.min(itemnumber, math.max(1, #menu.item_table)))
     end
     remember(firstItemOnPage())
 

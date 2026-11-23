@@ -7,6 +7,7 @@ Download and read articles from your Instapaper account directly in KOReader.
 - **Instapaper API v2** (bearer token, JSON), with API v1 kept as a fallback
 - **Log in with a personal access token**, or with email and password (xAuth, until 30 September 2027)
 - Browse **Unread**, **Starred**, **Archived**, and **custom folders**
+- **Unread tag filter** — choose a tag from your Instapaper account to hide matching articles or show only those articles (API v2)
 - **Download and read** articles as HTML or EPUB in KOReader's built-in reader
 - **EPUB output** — articles can be saved as EPUB files with optional image inclusion
 - **Book metadata** — byline (when the article markup carries one) and source site as authors, plus an auto-generated excerpt as the book description
@@ -20,7 +21,7 @@ Download and read articles from your Instapaper account directly in KOReader.
 - **Title injection** — missing article titles are added as a top-level heading in the downloaded HTML
 - **Reading progress** display (percentage read)
 - **Paged article lists** — 50 articles at a time with **Load more…** at the end (API v2); API v1 fetches one page of 10–500
-- **Refresh** — the reload icon at the top left of a list reloads it with the latest data, staying on the same page
+- **Refresh** — use the reload icon at the top left of the list, or **Refresh** in the Unread filter menu with API v2
 - **Continue** — for an hour after you last used a list (until KOReader restarts), **Continue: <folder> (page N)** at the top of the Instapaper menu reopens it where you left off, without a network request. Articles archived by **When finished** are left out and progress made on the device is shown. Also available as the gesture action **Instapaper: continue last list**; when there is nothing recent to continue, the gesture opens the last used folder (or Unread) fresh from the server and says so
 - **Send to Instapaper** — Add web links to Instapaper directly from document link popups
 - **Offline queue** — Links are queued when offline and automatically sent when network becomes available
@@ -28,6 +29,8 @@ Download and read articles from your Instapaper account directly in KOReader.
 - **Open downloads folder** shortcut in the menu
 - **Clear downloads cache** — delete all downloaded files and folders with a single tap
 - **Persistent credentials** — stay logged in across sessions
+
+See the [changelog](CHANGELOG.md) for release notes.
 
 ## Installation
 
@@ -119,6 +122,7 @@ to API v1 and asks you to try again. You can also switch by hand under
 
 From the Instapaper menu, choose:
 - **Unread articles** — Your reading list
+  - **Unread tag filter (API v2)** — Open **Unread articles** and tap the filter icon beside the section title. Choose **Hide a tag** or **Show only a tag**, then select a tag from your Instapaper account. Select **Turn off** to see all unread articles. Use **Refresh** in the same menu to reload the list.
 - **Starred articles** — Articles you've starred
 - **Archived articles** — Completed articles
 - **Custom folders** — Lists your user-created Instapaper folders; tap one to browse its articles
